@@ -951,6 +951,409 @@ async function runTests() {
   });
 
   // ============================================
+  // ABUSE / SECURITY TESTS
+  // ============================================
+  // Verify the system cannot be gamed or exploited
+
+  console.log('\n--- Abuse / Security Tests ---\n');
+
+  // Test: Sybil attack - splitting stake doesn't give advantage
+  await test('Abuse: Sybil attack (split stake) gives no advantage', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+
+    const tauSeconds = BigInt(5);
+    await ctx.initializePool(tauSeconds);
+
+    // Honest staker: 2 tokens in one account
+    const honest = Keypair.generate();
+    await connection.requestAirdrop(honest.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const honestToken = await ctx.createUserTokenAccount(honest.publicKey);
+    await ctx.mintTokens(honestToken, BigInt(2_000_000_000));
+    await ctx.stake(honest, honestToken, BigInt(2_000_000_000));
+
+    // Sybil attacker: 2 tokens split across 2 accounts (1 each)
+    const sybil1 = Keypair.generate();
+    const sybil2 = Keypair.generate();
+    await connection.requestAirdrop(sybil1.publicKey, 2 * LAMPORTS_PER_SOL);
+    await connection.requestAirdrop(sybil2.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const sybil1Token = await ctx.createUserTokenAccount(sybil1.publicKey);
+    const sybil2Token = await ctx.createUserTokenAccount(sybil2.publicKey);
+    await ctx.mintTokens(sybil1Token, BigInt(1_000_000_000));
+    await ctx.mintTokens(sybil2Token, BigInt(1_000_000_000));
+    await ctx.stake(sybil1, sybil1Token, BigInt(1_000_000_000));
+    await ctx.stake(sybil2, sybil2Token, BigInt(1_000_000_000));
+
+    // Wait for maturity
+    console.log(`    Waiting 15s for stakes to mature...`);
+    await new Promise(r => setTimeout(r, 15000));
+
+    // Deposit rewards
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // Claim for all
+    const honestBefore = await ctx.getBalance(honest.publicKey);
+    await ctx.claimRewards(honest);
+    const honestReward = (await ctx.getBalance(honest.publicKey)) - honestBefore;
+
+    const sybil1Before = await ctx.getBalance(sybil1.publicKey);
+    await ctx.claimRewards(sybil1);
+    const sybil1Reward = (await ctx.getBalance(sybil1.publicKey)) - sybil1Before;
+
+    const sybil2Before = await ctx.getBalance(sybil2.publicKey);
+    await ctx.claimRewards(sybil2);
+    const sybil2Reward = (await ctx.getBalance(sybil2.publicKey)) - sybil2Before;
+
+    const sybilTotal = sybil1Reward + sybil2Reward;
+
+    console.log(`    Honest (2 tokens): ${honestReward} lamports`);
+    console.log(`    Sybil (1+1 tokens): ${sybilTotal} lamports`);
+
+    // Sybil should NOT get more than honest staker
+    // Allow small variance for timing differences
+    const ratio = sybilTotal / honestReward;
+    console.log(`    Sybil/Honest ratio: ${ratio.toFixed(3)}`);
+
+    if (ratio > 1.1) {
+      throw new Error(`Sybil attack should not be profitable: ratio=${ratio}`);
+    }
+  });
+
+  // Test: Flash stake attack - staking right before deposit
+  await test('Abuse: Flash stake attack (stake before deposit) fails', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+
+    const tauSeconds = BigInt(5);
+    await ctx.initializePool(tauSeconds);
+
+    // Honest staker stakes early
+    const honest = Keypair.generate();
+    await connection.requestAirdrop(honest.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const honestToken = await ctx.createUserTokenAccount(honest.publicKey);
+    await ctx.mintTokens(honestToken, BigInt(1_000_000_000));
+    await ctx.stake(honest, honestToken, BigInt(1_000_000_000));
+
+    // Wait for honest staker to mature
+    console.log(`    Waiting 15s for honest staker to mature...`);
+    await new Promise(r => setTimeout(r, 15000));
+
+    // Attacker stakes right before deposit (flash stake)
+    const attacker = Keypair.generate();
+    await connection.requestAirdrop(attacker.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const attackerToken = await ctx.createUserTokenAccount(attacker.publicKey);
+    await ctx.mintTokens(attackerToken, BigInt(1_000_000_000));
+    await ctx.stake(attacker, attackerToken, BigInt(1_000_000_000));
+
+    // Deposit immediately after attacker stakes
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // Claim for both
+    const honestBefore = await ctx.getBalance(honest.publicKey);
+    await ctx.claimRewards(honest);
+    const honestReward = (await ctx.getBalance(honest.publicKey)) - honestBefore;
+
+    const attackerBefore = await ctx.getBalance(attacker.publicKey);
+    try {
+      await ctx.claimRewards(attacker);
+    } catch (e) {
+      // Expected - attacker has ~0 weight
+    }
+    const attackerReward = Math.max(0, (await ctx.getBalance(attacker.publicKey)) - attackerBefore);
+
+    console.log(`    Honest staker (mature) reward: ${honestReward} lamports`);
+    console.log(`    Flash attacker (new) reward: ${attackerReward} lamports`);
+
+    // Honest staker should get the vast majority (at 3τ = 95% weight vs ~0%)
+    const honestShare = (honestReward * 100) / (honestReward + attackerReward);
+    console.log(`    Honest staker share: ${honestShare.toFixed(1)}%`);
+
+    // With τ=5s and 15s wait (3τ), honest has ~95% weight, attacker has ~0%
+    // Honest should get >75% of rewards (accounting for timing variance)
+    if (honestShare < 75) {
+      throw new Error(`Flash stake should not be profitable: honest=${honestShare}%`);
+    }
+  });
+
+  // Test: Cannot unstake more than staked
+  await test('Abuse: Cannot unstake more than staked', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(100));
+
+    const user = Keypair.generate();
+    await connection.requestAirdrop(user.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Try to unstake 2x what was staked
+    let failed = false;
+    try {
+      await ctx.unstake(user, userToken, BigInt(2_000_000_000));
+    } catch (e: any) {
+      failed = true;
+      console.log(`    Correctly rejected: ${e.message?.includes('0xa') ? 'InsufficientStakeBalance' : 'error'}`);
+    }
+
+    if (!failed) {
+      throw new Error('Should not be able to unstake more than staked');
+    }
+  });
+
+  // Test: Cannot claim after full unstake
+  await test('Abuse: Cannot claim after full unstake', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(10));
+
+    const user = Keypair.generate();
+    await connection.requestAirdrop(user.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Wait for weight, deposit rewards
+    await new Promise(r => setTimeout(r, 2000));
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // Claim rewards first
+    await ctx.claimRewards(user);
+
+    // Fully unstake
+    await ctx.unstake(user, userToken, BigInt(1_000_000_000));
+
+    // Deposit more rewards
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // Try to claim again (should fail - no stake)
+    let failed = false;
+    try {
+      await ctx.claimRewards(user);
+    } catch (e: any) {
+      failed = true;
+      console.log(`    Correctly rejected claim after unstake`);
+    }
+
+    if (!failed) {
+      throw new Error('Should not be able to claim after full unstake');
+    }
+  });
+
+  // Test: Cannot double claim
+  await test('Abuse: Cannot double claim same rewards', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(10));
+
+    const user = Keypair.generate();
+    await connection.requestAirdrop(user.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Wait and deposit
+    await new Promise(r => setTimeout(r, 2000));
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // First claim
+    const balance1 = await ctx.getBalance(user.publicKey);
+    await ctx.claimRewards(user);
+    const reward1 = (await ctx.getBalance(user.publicKey)) - balance1;
+    console.log(`    First claim: ${reward1} lamports`);
+
+    // Second claim (should get 0 or fail)
+    const balance2 = await ctx.getBalance(user.publicKey);
+    try {
+      await ctx.claimRewards(user);
+    } catch (e) {
+      // May fail with "no pending rewards"
+    }
+    const reward2 = (await ctx.getBalance(user.publicKey)) - balance2;
+    console.log(`    Second claim: ${reward2} lamports`);
+
+    if (reward2 > reward1 / 100) { // Allow tiny dust
+      throw new Error(`Double claim should not work: got ${reward2} on second claim`);
+    }
+  });
+
+  // Test: Stake/unstake cycling doesn't reset weight unfairly
+  await test('Abuse: Stake/unstake cycling resets weight', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+
+    const tauSeconds = BigInt(5);
+    await ctx.initializePool(tauSeconds);
+
+    // Honest staker - stakes and holds
+    const honest = Keypair.generate();
+    await connection.requestAirdrop(honest.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const honestToken = await ctx.createUserTokenAccount(honest.publicKey);
+    await ctx.mintTokens(honestToken, BigInt(1_000_000_000));
+    await ctx.stake(honest, honestToken, BigInt(1_000_000_000));
+
+    // Cycler - stakes, waits, unstakes, restakes (trying to game)
+    const cycler = Keypair.generate();
+    await connection.requestAirdrop(cycler.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const cyclerToken = await ctx.createUserTokenAccount(cycler.publicKey);
+    await ctx.mintTokens(cyclerToken, BigInt(1_000_000_000));
+    await ctx.stake(cycler, cyclerToken, BigInt(1_000_000_000));
+
+    // Wait 10s
+    console.log(`    Waiting 10s...`);
+    await new Promise(r => setTimeout(r, 10000));
+
+    // Cycler unstakes and restakes (resets their weight!)
+    await ctx.unstake(cycler, cyclerToken, BigInt(1_000_000_000));
+    await ctx.stake(cycler, cyclerToken, BigInt(1_000_000_000));
+
+    // Deposit rewards
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // Claim
+    const honestBefore = await ctx.getBalance(honest.publicKey);
+    await ctx.claimRewards(honest);
+    const honestReward = (await ctx.getBalance(honest.publicKey)) - honestBefore;
+
+    const cyclerBefore = await ctx.getBalance(cycler.publicKey);
+    try {
+      await ctx.claimRewards(cycler);
+    } catch (e) {
+      // May fail if weight is too low
+    }
+    const cyclerReward = Math.max(0, (await ctx.getBalance(cycler.publicKey)) - cyclerBefore);
+
+    console.log(`    Honest (held 10s): ${honestReward} lamports`);
+    console.log(`    Cycler (reset weight): ${cyclerReward} lamports`);
+
+    // Honest should get more since cycler reset their weight
+    if (honestReward <= cyclerReward && cyclerReward > 0) {
+      throw new Error(`Cycling should reset weight: honest=${honestReward}, cycler=${cyclerReward}`);
+    }
+  });
+
+  // Test: Zero amount operations fail
+  await test('Abuse: Zero amount operations rejected', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(100));
+
+    const user = Keypair.generate();
+    await connection.requestAirdrop(user.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+
+    // Try zero stake
+    let zeroStakeFailed = false;
+    try {
+      await ctx.stake(user, userToken, BigInt(0));
+    } catch (e) {
+      zeroStakeFailed = true;
+    }
+
+    // Stake normally first
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Try zero unstake
+    let zeroUnstakeFailed = false;
+    try {
+      await ctx.unstake(user, userToken, BigInt(0));
+    } catch (e) {
+      zeroUnstakeFailed = true;
+    }
+
+    // Try zero deposit
+    let zeroDepositFailed = false;
+    try {
+      await ctx.depositRewards(BigInt(0));
+    } catch (e) {
+      zeroDepositFailed = true;
+    }
+
+    console.log(`    Zero stake rejected: ${zeroStakeFailed}`);
+    console.log(`    Zero unstake rejected: ${zeroUnstakeFailed}`);
+    console.log(`    Zero deposit rejected: ${zeroDepositFailed}`);
+
+    if (!zeroStakeFailed || !zeroUnstakeFailed || !zeroDepositFailed) {
+      throw new Error('Zero amount operations should be rejected');
+    }
+  });
+
+  // Test: Frontrunning deposit with equal stake
+  // Note: With vastly different stake amounts, the attacker may still win on absolute weight
+  // This test verifies that equal stakes favor the mature staker
+  await test('Abuse: Frontrunning deposit (equal stakes)', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+
+    const tauSeconds = BigInt(5);
+    await ctx.initializePool(tauSeconds);
+
+    // Honest staker
+    const honest = Keypair.generate();
+    await connection.requestAirdrop(honest.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const honestToken = await ctx.createUserTokenAccount(honest.publicKey);
+    await ctx.mintTokens(honestToken, BigInt(1_000_000_000));
+    await ctx.stake(honest, honestToken, BigInt(1_000_000_000));
+
+    // Wait for honest to mature
+    console.log(`    Waiting 15s for honest staker to mature...`);
+    await new Promise(r => setTimeout(r, 15000));
+
+    // Frontrunner stakes equal amount right before deposit
+    const attacker = Keypair.generate();
+    await connection.requestAirdrop(attacker.publicKey, 2 * LAMPORTS_PER_SOL);
+    await new Promise(r => setTimeout(r, 500));
+    const attackerToken = await ctx.createUserTokenAccount(attacker.publicKey);
+    await ctx.mintTokens(attackerToken, BigInt(1_000_000_000));
+    await ctx.stake(attacker, attackerToken, BigInt(1_000_000_000));
+
+    // Deposit immediately
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // Claim
+    const honestBefore = await ctx.getBalance(honest.publicKey);
+    await ctx.claimRewards(honest);
+    const honestReward = (await ctx.getBalance(honest.publicKey)) - honestBefore;
+
+    const attackerBefore = await ctx.getBalance(attacker.publicKey);
+    try {
+      await ctx.claimRewards(attacker);
+    } catch (e) {}
+    const attackerReward = Math.max(0, (await ctx.getBalance(attacker.publicKey)) - attackerBefore);
+
+    const total = honestReward + attackerReward;
+    const honestShare = (honestReward * 100) / total;
+
+    console.log(`    Honest (1 token, mature): ${honestShare.toFixed(1)}% (${honestReward} lamports)`);
+    console.log(`    Attacker (1 token, new): ${(100-honestShare).toFixed(1)}% (${attackerReward} lamports)`);
+
+    // With equal stakes, mature staker should dominate
+    if (honestShare < 75) {
+      throw new Error(`Frontrunning should not be profitable: honest only got ${honestShare}%`);
+    }
+  });
+
+  // ============================================
   // STRESS TESTS: Simulate 1 million stakers
   // ============================================
   // Since operations are O(1), complexity depends on value magnitudes, not staker count.
