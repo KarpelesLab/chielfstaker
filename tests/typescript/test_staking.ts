@@ -923,8 +923,8 @@ async function runTests() {
     await ctx.updatePoolSettings(ctx.payer, BigInt(1_000_000_000), null, null);
 
     const user = Keypair.generate();
-    await connection.requestAirdrop(user.publicKey, LAMPORTS_PER_SOL);
-    await new Promise(r => setTimeout(r, 500));
+    const airdropSig = await connection.requestAirdrop(user.publicKey, LAMPORTS_PER_SOL);
+    await connection.confirmTransaction(airdropSig);
     const userToken = await ctx.createUserTokenAccount(user.publicKey);
     await ctx.mintTokens(userToken, BigInt(2_000_000_000));
 
