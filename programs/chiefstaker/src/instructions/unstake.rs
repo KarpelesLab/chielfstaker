@@ -40,7 +40,11 @@ pub fn execute_unstake<'a>(
     let clock = Clock::get()?;
     let current_time = clock.unix_timestamp;
 
-    // Calculate and claim pending rewards first
+    // Calculate pending rewards (but defer SOL transfer until after token CPI,
+    // because the Solana runtime verifies CPI account balances and user_info
+    // is not a CPI account)
+    let mut reward_transfer_amount: u64 = 0;
+
     let total_weighted = calculate_total_weighted_stake(
         pool.total_staked,
         &pool.get_sum_stake_exp(),
@@ -58,30 +62,23 @@ pub fn execute_unstake<'a>(
     )?;
 
     if total_weighted > 0 && user_weighted > 0 {
-        // Calculate pending rewards
         let pending = wad_mul(user_weighted, pool.acc_reward_per_weighted_share)?
             .saturating_sub(user_stake.reward_debt);
 
         if pending > 0 {
-            // Convert from WAD-scaled to lamports
             let pending_lamports = pending / WAD;
 
             if pending_lamports > 0 {
-                // Check pool has sufficient balance
                 let pool_lamports = pool_info.lamports();
                 let rent_exempt_minimum = solana_program::rent::Rent::get()?
                     .minimum_balance(pool_info.data_len());
 
                 let available_rewards = pool_lamports.saturating_sub(rent_exempt_minimum);
-                let transfer_amount = pending_lamports.min(available_rewards as u128) as u64;
+                reward_transfer_amount = pending_lamports.min(available_rewards as u128) as u64;
 
-                if transfer_amount > 0 {
-                    // Transfer SOL rewards from pool to user
-                    **pool_info.try_borrow_mut_lamports()? -= transfer_amount;
-                    **user_info.try_borrow_mut_lamports()? += transfer_amount;
-                    // Update last_synced_lamports so sync_rewards doesn't miss new deposits
-                    pool.last_synced_lamports = pool.last_synced_lamports.saturating_sub(transfer_amount);
-                    msg!("Claimed {} lamports in rewards", transfer_amount);
+                // Pre-update last_synced_lamports (actual SOL transfer deferred to after CPI)
+                if reward_transfer_amount > 0 {
+                    pool.last_synced_lamports = pool.last_synced_lamports.saturating_sub(reward_transfer_amount);
                 }
             }
         }
@@ -127,7 +124,7 @@ pub fn execute_unstake<'a>(
         user_stake.reward_debt = 0;
     }
 
-    // Save states
+    // Save states (before CPI — pool data includes pre-updated last_synced_lamports)
     {
         let mut pool_data = pool_info.try_borrow_mut_data()?;
         pool.serialize(&mut &mut pool_data[..])?;
@@ -137,13 +134,12 @@ pub fn execute_unstake<'a>(
         user_stake.serialize(&mut &mut stake_data[..])?;
     }
 
-    // Transfer tokens from vault to user
+    // Transfer tokens from vault to user (CPI)
     let mint_data = mint_info.try_borrow_data()?;
     let mint = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&mint_data)?;
     let decimals = mint.base.decimals;
     drop(mint_data);
 
-    // Pool PDA owns the vault, so we need pool seeds for signing
     let (_, pool_bump) =
         Pubkey::find_program_address(&[POOL_SEED, pool.mint.as_ref()], program_id);
     let pool_seeds = &[POOL_SEED, pool.mint.as_ref(), &[pool_bump]];
@@ -154,7 +150,7 @@ pub fn execute_unstake<'a>(
             token_vault_info.key,
             mint_info.key,
             user_token_info.key,
-            pool_info.key, // Pool is the owner/authority of the vault
+            pool_info.key,
             &[],
             amount,
             decimals,
@@ -167,6 +163,14 @@ pub fn execute_unstake<'a>(
         ],
         &[pool_seeds],
     )?;
+
+    // Transfer SOL rewards AFTER token CPI to avoid CPI balance check failure
+    // (pool_info is a CPI account but user_info is not)
+    if reward_transfer_amount > 0 {
+        **pool_info.try_borrow_mut_lamports()? -= reward_transfer_amount;
+        **user_info.try_borrow_mut_lamports()? += reward_transfer_amount;
+        msg!("Claimed {} lamports in rewards", reward_transfer_amount);
+    }
 
     msg!("Unstaked {} tokens", amount);
 
