@@ -36,9 +36,8 @@ pub fn execute_unstake<'a>(
     mint_info: &AccountInfo<'a>,
     user_info: &AccountInfo<'a>,
     amount: u64,
+    current_time: i64,
 ) -> ProgramResult {
-    let clock = Clock::get()?;
-    let current_time = clock.unix_timestamp;
 
     // Calculate pending rewards (but defer SOL transfer until after token CPI,
     // because the Solana runtime verifies CPI account balances and user_info
@@ -61,6 +60,9 @@ pub fn execute_unstake<'a>(
         pool.tau_seconds,
     )?;
 
+    // Track unpaid rewards (WAD-scaled) to carry forward in reward_debt
+    let mut unpaid_rewards_wad: u128 = 0;
+
     if total_weighted > 0 && user_weighted > 0 {
         let pending = wad_mul(user_weighted, pool.acc_reward_per_weighted_share)?
             .saturating_sub(user_stake.reward_debt);
@@ -75,6 +77,12 @@ pub fn execute_unstake<'a>(
 
                 let available_rewards = pool_lamports.saturating_sub(rent_exempt_minimum);
                 reward_transfer_amount = pending_lamports.min(available_rewards as u128) as u64;
+
+                // Track unpaid portion so it remains claimable later
+                let paid_wad = (reward_transfer_amount as u128)
+                    .checked_mul(WAD)
+                    .ok_or(StakingError::MathOverflow)?;
+                unpaid_rewards_wad = pending.saturating_sub(paid_wad);
 
                 // Pre-update last_synced_lamports (actual SOL transfer deferred to after CPI)
                 if reward_transfer_amount > 0 {
@@ -91,11 +99,10 @@ pub fn execute_unstake<'a>(
         user_stake.exp_start_factor,
     )?;
 
-    // Update pool sum_stake_exp
+    // Update pool sum_stake_exp (saturating to handle rounding drift)
     let new_sum = pool
         .get_sum_stake_exp()
-        .checked_sub(U256::from_u128(unstake_contribution))
-        .ok_or(StakingError::MathUnderflow)?;
+        .saturating_sub(U256::from_u128(unstake_contribution));
     pool.set_sum_stake_exp(new_sum);
 
     // Update pool total staked
@@ -110,7 +117,7 @@ pub fn execute_unstake<'a>(
         .checked_sub(amount)
         .ok_or(StakingError::MathUnderflow)?;
 
-    // Recalculate reward debt for remaining stake
+    // Recalculate reward debt for remaining stake, preserving any unpaid rewards
     if user_stake.amount > 0 {
         let new_user_weighted = calculate_user_weighted_stake(
             user_stake.amount,
@@ -119,7 +126,9 @@ pub fn execute_unstake<'a>(
             pool.base_time,
             pool.tau_seconds,
         )?;
-        user_stake.reward_debt = wad_mul(new_user_weighted, pool.acc_reward_per_weighted_share)?;
+        let base_debt = wad_mul(new_user_weighted, pool.acc_reward_per_weighted_share)?;
+        // Subtract unpaid rewards so they remain claimable
+        user_stake.reward_debt = base_debt.saturating_sub(unpaid_rewards_wad);
     } else {
         user_stake.reward_debt = 0;
     }
@@ -218,6 +227,17 @@ pub fn process_unstake(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
+    // Check if pool needs rebasing
+    if pool.get_sum_stake_exp().needs_rebase() {
+        return Err(StakingError::PoolRequiresSync.into());
+    }
+
     // If pool has a cooldown, reject direct unstake
     if pool.unstake_cooldown_seconds > 0 {
         return Err(StakingError::CooldownRequired.into());
@@ -270,13 +290,14 @@ pub fn process_unstake(
     // Lazily adjust exp_start_factor if pool has been rebased
     user_stake.sync_to_pool(&pool)?;
 
+    let clock = Clock::get()?;
+    let current_time = clock.unix_timestamp;
+
     // Check lock duration
     if pool.lock_duration_seconds > 0 {
-        let clock = Clock::get()?;
-        let current_time = clock.unix_timestamp;
         let last_stake = user_stake.effective_last_stake_time();
-        let elapsed = current_time.saturating_sub(last_stake);
-        if (elapsed as u64) < pool.lock_duration_seconds {
+        let elapsed = current_time.saturating_sub(last_stake).max(0) as u64;
+        if elapsed < pool.lock_duration_seconds {
             return Err(StakingError::StakeLocked.into());
         }
     }
@@ -293,5 +314,6 @@ pub fn process_unstake(
         mint_info,
         user_info,
         amount,
+        current_time,
     )
 }

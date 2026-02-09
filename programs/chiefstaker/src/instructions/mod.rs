@@ -12,6 +12,7 @@ pub mod transfer_authority;
 pub mod request_unstake;
 pub mod complete_unstake;
 pub mod cancel_unstake;
+pub mod close_stake;
 
 pub use initialize::*;
 pub use stake::*;
@@ -25,3 +26,4 @@ pub use transfer_authority::*;
 pub use request_unstake::*;
 pub use complete_unstake::*;
 pub use cancel_unstake::*;
+pub use close_stake::*;

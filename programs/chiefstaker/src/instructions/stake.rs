@@ -16,7 +16,7 @@ use spl_token_2022::extension::StateWithExtensions;
 
 use crate::{
     error::StakingError,
-    math::{calculate_user_weighted_stake, exp_time_ratio, wad_mul, U256, WAD},
+    math::{calculate_user_weighted_stake, exp_time_ratio, wad_mul, MAX_EXP_INPUT, U256, WAD},
     state::{StakingPool, UserStake, STAKE_SEED},
 };
 
@@ -65,6 +65,12 @@ pub fn process_stake(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
     // Verify mint matches pool
     if pool.mint != *mint_info.key {
         return Err(StakingError::InvalidPoolMint.into());
@@ -85,13 +91,24 @@ pub fn process_stake(
     let clock = Clock::get()?;
     let current_time = clock.unix_timestamp;
 
-    // Check if pool needs rebasing
+    // Check if pool needs rebasing (sum_stake_exp near overflow)
     if pool.get_sum_stake_exp().needs_rebase() {
         return Err(StakingError::PoolRequiresSync.into());
     }
 
     // Calculate exp_start_factor for this stake
     let time_since_base = current_time.saturating_sub(pool.base_time);
+
+    // Check if time_since_base / tau would overflow exp_wad.
+    // Require SyncPool first if the ratio exceeds MAX_EXP_INPUT.
+    let ratio_wad = (time_since_base as u128)
+        .checked_mul(WAD)
+        .ok_or(StakingError::MathOverflow)?
+        / (pool.tau_seconds as u128);
+    if ratio_wad > MAX_EXP_INPUT {
+        return Err(StakingError::PoolRequiresSync.into());
+    }
+
     let exp_start_factor = exp_time_ratio(time_since_base, pool.tau_seconds)?;
 
     // Create or update user stake account
@@ -189,7 +206,9 @@ pub fn process_stake(
         // Lazily adjust exp_start_factor if pool has been rebased
         user_stake.sync_to_pool(&pool)?;
 
-        // Auto-claim pending rewards before resetting reward_debt
+        // Auto-claim pending rewards before resetting reward_debt.
+        // Track any unpaid portion so it remains claimable after the stake update.
+        let mut unpaid_rewards_wad: u128 = 0;
         let user_weighted_before = calculate_user_weighted_stake(
             user_stake.amount,
             user_stake.exp_start_factor,
@@ -214,6 +233,11 @@ pub fn process_stake(
                             pool.last_synced_lamports.saturating_sub(transfer);
                         msg!("Auto-claimed {} lamports in pending rewards", transfer);
                     }
+                    // Track unpaid portion so it remains claimable
+                    let paid_wad = (transfer as u128)
+                        .checked_mul(WAD)
+                        .ok_or(StakingError::MathOverflow)?;
+                    unpaid_rewards_wad = pending.saturating_sub(paid_wad);
                 }
             }
         }
@@ -254,7 +278,8 @@ pub fn process_stake(
         // Note: stake_time stays as original for weight calculation purposes
         user_stake.last_stake_time = current_time;
 
-        // Recalculate reward_debt for new weighted stake to prevent reward theft
+        // Recalculate reward_debt for new weighted stake to prevent reward theft.
+        // Subtract any unpaid rewards so they remain claimable.
         let new_user_weighted = calculate_user_weighted_stake(
             total_amount,
             new_exp_factor,
@@ -262,7 +287,8 @@ pub fn process_stake(
             pool.base_time,
             pool.tau_seconds,
         )?;
-        user_stake.reward_debt = wad_mul(new_user_weighted, pool.acc_reward_per_weighted_share)?;
+        let base_debt = wad_mul(new_user_weighted, pool.acc_reward_per_weighted_share)?;
+        user_stake.reward_debt = base_debt.saturating_sub(unpaid_rewards_wad);
 
         let mut stake_data = user_stake_info.try_borrow_mut_data()?;
         user_stake.serialize(&mut &mut stake_data[..])?;

@@ -47,6 +47,17 @@ pub fn process_claim_rewards(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
+    // Check if pool needs rebasing
+    if pool.get_sum_stake_exp().needs_rebase() {
+        return Err(StakingError::PoolRequiresSync.into());
+    }
+
     // Load and validate user stake
     if user_stake_info.owner != program_id {
         return Err(StakingError::InvalidAccountOwner.into());
@@ -131,8 +142,15 @@ pub fn process_claim_rewards(
     **pool_info.try_borrow_mut_lamports()? -= transfer_amount;
     **user_info.try_borrow_mut_lamports()? += transfer_amount;
 
-    // Update reward debt to prevent double claiming
-    user_stake.reward_debt = accumulated;
+    // Only advance reward_debt by the amount actually paid out.
+    // If pool has insufficient SOL, the unpaid portion remains claimable later.
+    let paid_wad = (transfer_amount as u128)
+        .checked_mul(WAD)
+        .ok_or(StakingError::MathOverflow)?;
+    user_stake.reward_debt = user_stake
+        .reward_debt
+        .checked_add(paid_wad)
+        .ok_or(StakingError::MathOverflow)?;
 
     // Update last_synced_lamports so sync_rewards doesn't miss new deposits
     pool.last_synced_lamports = pool.last_synced_lamports.saturating_sub(transfer_amount);

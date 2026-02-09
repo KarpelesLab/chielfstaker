@@ -50,6 +50,12 @@ pub fn process_request_unstake(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
     // Require cooldown to be configured; otherwise use direct Unstake
     if pool.unstake_cooldown_seconds == 0 {
         return Err(StakingError::CooldownNotConfigured.into());
@@ -98,8 +104,8 @@ pub fn process_request_unstake(
     // Check lock duration has elapsed
     if pool.lock_duration_seconds > 0 {
         let last_stake = user_stake.effective_last_stake_time();
-        let elapsed = current_time.saturating_sub(last_stake);
-        if (elapsed as u64) < pool.lock_duration_seconds {
+        let elapsed = current_time.saturating_sub(last_stake).max(0) as u64;
+        if elapsed < pool.lock_duration_seconds {
             return Err(StakingError::StakeLocked.into());
         }
     }

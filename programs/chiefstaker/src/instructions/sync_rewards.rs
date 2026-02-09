@@ -46,6 +46,17 @@ pub fn process_sync_rewards(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
+    // Check if pool needs rebasing
+    if pool.get_sum_stake_exp().needs_rebase() {
+        return Err(StakingError::PoolRequiresSync.into());
+    }
+
     let rent = Rent::get()?;
     let clock = Clock::get()?;
     let current_time = clock.unix_timestamp;

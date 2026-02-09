@@ -24,9 +24,10 @@ pub const INV_LN2_WAD: u128 = 1_442_695_040_888_963_407;
 /// e scaled by WAD: 2.718281828459045235...
 pub const E_WAD: u128 = 2_718_281_828_459_045_235;
 
-/// Maximum safe exponent input (scaled by WAD) to avoid overflow
-/// e^87 < 2^128, so we cap at ~87 WAD
-pub const MAX_EXP_INPUT: u128 = 87_000_000_000_000_000_000;
+/// Maximum safe exponent input (scaled by WAD) to avoid overflow.
+/// exp_wad overflows its u128 intermediate (2^int_part * WAD) around x ≈ 48 WAD,
+/// so we cap at 42 WAD (matching EXP_NEG_ZERO_THRESHOLD) which is well within safe range.
+pub const MAX_EXP_INPUT: u128 = 42_000_000_000_000_000_000;
 
 /// Threshold for sum_stake_exp to trigger rebase (near U256 max / 2)
 pub const REBASE_THRESHOLD: U256 = U256([u64::MAX / 2, u64::MAX, u64::MAX, u64::MAX / 2]);
@@ -259,13 +260,13 @@ pub fn calculate_total_weighted_stake(
     let decay_term = wad_mul_u256(*sum_stake_exp, exp_neg_u256)?;
 
     // total_staked * WAD - decay_term
+    // Use saturating_sub to handle accumulated rounding drift between
+    // pool-level and user-level wad_mul operations after rebases.
     let total_staked_wad = U256::from_u128(total_staked)
         .checked_mul(WAD_U256)
         .ok_or(StakingError::MathOverflow)?;
 
-    let weighted = total_staked_wad
-        .checked_sub(decay_term)
-        .ok_or(StakingError::MathUnderflow)?;
+    let weighted = total_staked_wad.saturating_sub(decay_term);
 
     // Convert back from U256 to u128
     weighted.to_u128().ok_or(StakingError::MathOverflow)

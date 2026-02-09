@@ -90,6 +90,12 @@ pub enum StakingError {
 
     #[error("Pool has no cooldown configured - use direct Unstake instead")]
     CooldownNotConfigured,
+
+    #[error("Setting value exceeds maximum allowed")]
+    SettingExceedsMaximum,
+
+    #[error("User stake account still has balance or pending requests")]
+    AccountNotEmpty,
 }
 
 impl From<StakingError> for ProgramError {

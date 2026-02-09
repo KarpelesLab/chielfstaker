@@ -54,6 +54,17 @@ pub fn process_complete_unstake(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
+    // Check if pool needs rebasing
+    if pool.get_sum_stake_exp().needs_rebase() {
+        return Err(StakingError::PoolRequiresSync.into());
+    }
+
     // Verify mint matches pool
     if pool.mint != *mint_info.key {
         return Err(StakingError::InvalidPoolMint.into());
@@ -96,8 +107,8 @@ pub fn process_complete_unstake(
     // Check cooldown has elapsed
     let clock = Clock::get()?;
     let current_time = clock.unix_timestamp;
-    let elapsed = current_time.saturating_sub(user_stake.unstake_request_time);
-    if (elapsed as u64) < pool.unstake_cooldown_seconds {
+    let elapsed = current_time.saturating_sub(user_stake.unstake_request_time).max(0) as u64;
+    if elapsed < pool.unstake_cooldown_seconds {
         return Err(StakingError::CooldownNotElapsed.into());
     }
 
@@ -122,5 +133,6 @@ pub fn process_complete_unstake(
         mint_info,
         user_info,
         amount,
+        current_time,
     )
 }

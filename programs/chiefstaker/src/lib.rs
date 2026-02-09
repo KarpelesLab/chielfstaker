@@ -156,6 +156,14 @@ pub enum StakingInstruction {
     /// 1. `[writable]` User stake account
     /// 2. `[signer]` User/owner
     CancelUnstakeRequest,
+
+    /// Close a zero-balance user stake account to reclaim rent
+    ///
+    /// Accounts:
+    /// 0. `[]` Pool account
+    /// 1. `[writable]` User stake account
+    /// 2. `[writable, signer]` User/owner
+    CloseStakeAccount,
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -235,6 +243,10 @@ pub fn process_instruction(
         StakingInstruction::CancelUnstakeRequest => {
             msg!("Instruction: CancelUnstakeRequest");
             process_cancel_unstake_request(program_id, accounts)
+        }
+        StakingInstruction::CloseStakeAccount => {
+            msg!("Instruction: CloseStakeAccount");
+            process_close_stake_account(program_id, accounts)
         }
     }
 }

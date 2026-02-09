@@ -13,6 +13,12 @@ use crate::{
     state::StakingPool,
 };
 
+/// Maximum lock duration: 365 days. Prevents authority from trapping stakers indefinitely.
+const MAX_LOCK_DURATION_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// Maximum unstake cooldown: 30 days.
+const MAX_UNSTAKE_COOLDOWN_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 /// Update pool settings (authority only)
 ///
 /// Accounts:
@@ -44,6 +50,12 @@ pub fn process_update_pool_settings(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
     // Check authority is not renounced
     if pool.is_authority_renounced() {
         return Err(StakingError::AuthorityRenounced.into());
@@ -54,16 +66,22 @@ pub fn process_update_pool_settings(
         return Err(StakingError::InvalidAuthority.into());
     }
 
-    // Apply settings
+    // Apply settings (with caps to prevent authority abuse)
     if let Some(val) = min_stake_amount {
         pool.min_stake_amount = val;
         msg!("Updated min_stake_amount to {}", val);
     }
     if let Some(val) = lock_duration_seconds {
+        if val > MAX_LOCK_DURATION_SECONDS {
+            return Err(StakingError::SettingExceedsMaximum.into());
+        }
         pool.lock_duration_seconds = val;
         msg!("Updated lock_duration_seconds to {}", val);
     }
     if let Some(val) = unstake_cooldown_seconds {
+        if val > MAX_UNSTAKE_COOLDOWN_SECONDS {
+            return Err(StakingError::SettingExceedsMaximum.into());
+        }
         pool.unstake_cooldown_seconds = val;
         msg!("Updated unstake_cooldown_seconds to {}", val);
     }

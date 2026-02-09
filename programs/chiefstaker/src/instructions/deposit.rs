@@ -60,6 +60,17 @@ pub fn process_deposit_rewards(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
+    // Check if pool needs rebasing
+    if pool.get_sum_stake_exp().needs_rebase() {
+        return Err(StakingError::PoolRequiresSync.into());
+    }
+
     let clock = Clock::get()?;
     let current_time = clock.unix_timestamp;
 
@@ -102,7 +113,7 @@ pub fn process_deposit_rewards(
     // while total_weighted was below threshold) alongside this deposit.
     let current_available = pool_info.lamports().saturating_sub(rent_exempt_minimum);
     let undistributed = current_available.saturating_sub(pool.last_synced_lamports);
-    let total_new_rewards = (amount as u64).saturating_add(undistributed);
+    let total_new_rewards = amount.saturating_add(undistributed);
 
     // Calculate reward per weighted share
     // reward_per_share = total_new_rewards * WAD / total_weighted

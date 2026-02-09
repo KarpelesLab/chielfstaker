@@ -40,6 +40,12 @@ pub fn process_sync_pool(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
     let clock = Clock::get()?;
     let current_time = clock.unix_timestamp;
 

@@ -43,6 +43,12 @@ pub fn process_transfer_authority(
         return Err(StakingError::NotInitialized.into());
     }
 
+    // Verify pool PDA
+    let (expected_pool, _) = StakingPool::derive_pda(&pool.mint, program_id);
+    if *pool_info.key != expected_pool {
+        return Err(StakingError::InvalidPDA.into());
+    }
+
     // Check authority is not already renounced
     if pool.is_authority_renounced() {
         return Err(StakingError::AuthorityRenounced.into());

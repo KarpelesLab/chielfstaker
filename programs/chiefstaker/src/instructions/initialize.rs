@@ -12,7 +12,10 @@ use solana_program::{
     system_instruction,
     sysvar::Sysvar,
 };
-use spl_token_2022::{extension::StateWithExtensions, state::Mint};
+use spl_token_2022::{
+    extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    state::Mint,
+};
 
 use crate::{
     error::StakingError,
@@ -61,7 +64,15 @@ pub fn process_initialize_pool(
 
     // Verify mint is valid by trying to unpack it
     let mint_data = mint_info.try_borrow_data()?;
-    let _mint = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+    let mint_state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+
+    // Reject mints with transfer fee extension — fee-on-transfer tokens
+    // would cause total_staked to diverge from actual vault balance,
+    // eventually bricking unstakes for later users.
+    if mint_state.get_extension::<TransferFeeConfig>().is_ok() {
+        msg!("Token 2022 mints with TransferFee extension are not supported");
+        return Err(StakingError::InvalidPoolMint.into());
+    }
 
     // Derive and verify pool PDA
     let (expected_pool, pool_bump) =

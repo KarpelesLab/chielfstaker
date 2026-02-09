@@ -1,6 +1,6 @@
-//! Cancel unstake request instruction
+//! Close an empty user stake account to reclaim rent
 
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -13,13 +13,13 @@ use crate::{
     state::{StakingPool, UserStake},
 };
 
-/// Cancel a pending unstake request
+/// Close a zero-balance user stake account, returning rent to the user.
 ///
 /// Accounts:
 /// 0. `[]` Pool account
-/// 1. `[writable]` User stake account
-/// 2. `[signer]` User/owner
-pub fn process_cancel_unstake_request(
+/// 1. `[writable]` User stake account (PDA: ["stake", pool, owner])
+/// 2. `[writable, signer]` User/owner (receives rent)
+pub fn process_close_stake_account(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
@@ -53,7 +53,7 @@ pub fn process_cancel_unstake_request(
     if user_stake_info.owner != program_id {
         return Err(StakingError::InvalidAccountOwner.into());
     }
-    let mut user_stake = UserStake::try_from_slice(&user_stake_info.try_borrow_data()?)?;
+    let user_stake = UserStake::try_from_slice(&user_stake_info.try_borrow_data()?)?;
     if !user_stake.is_initialized() {
         return Err(StakingError::NotInitialized.into());
     }
@@ -73,25 +73,21 @@ pub fn process_cancel_unstake_request(
         return Err(StakingError::InvalidPDA.into());
     }
 
-    // Lazily adjust exp_start_factor if pool has been rebased
-    user_stake.sync_to_pool(&pool)?;
-
-    // Check there is a pending request
-    if !user_stake.has_pending_unstake_request() {
-        return Err(StakingError::NoPendingUnstakeRequest.into());
+    // Account must be empty: no staked tokens and no pending unstake request
+    if user_stake.amount > 0 || user_stake.has_pending_unstake_request() {
+        return Err(StakingError::AccountNotEmpty.into());
     }
 
-    let cancelled_amount = user_stake.unstake_request_amount;
+    // Transfer all lamports from stake account to user (closes the account)
+    let stake_lamports = user_stake_info.lamports();
+    **user_stake_info.try_borrow_mut_lamports()? = 0;
+    **user_info.try_borrow_mut_lamports()? += stake_lamports;
 
-    // Clear the request fields
-    user_stake.unstake_request_amount = 0;
-    user_stake.unstake_request_time = 0;
-
-    // Save user stake
+    // Zero out the account data so it can't be re-read as a valid stake
     let mut stake_data = user_stake_info.try_borrow_mut_data()?;
-    user_stake.serialize(&mut &mut stake_data[..])?;
+    stake_data.fill(0);
 
-    msg!("Cancelled unstake request for {} tokens", cancelled_amount);
+    msg!("Closed user stake account, returned {} lamports", stake_lamports);
 
     Ok(())
 }
