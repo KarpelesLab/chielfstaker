@@ -62,10 +62,12 @@ pub fn execute_unstake<'a>(
 
     // Track unpaid rewards (WAD-scaled) to carry forward in reward_debt
     let mut unpaid_rewards_wad: u128 = 0;
+    let mut actual_pending_wad: u128 = 0;
 
     if total_weighted > 0 && user_weighted > 0 {
         let pending = wad_mul(user_weighted, pool.acc_reward_per_weighted_share)?
             .saturating_sub(user_stake.reward_debt);
+        actual_pending_wad = pending;
 
         if pending > 0 {
             let pending_lamports = pending / WAD;
@@ -90,6 +92,32 @@ pub fn execute_unstake<'a>(
                 }
             }
         }
+    }
+
+    // Calculate stranded rewards: allocated at max weight but not claimable at actual weight.
+    // Return them to the pool (via last_synced_lamports) so the next sync_rewards
+    // redistributes them to remaining stakers.
+    let amount_wad_full = (user_stake.amount as u128)
+        .checked_mul(WAD)
+        .ok_or(StakingError::MathOverflow)?;
+    let max_pending_wad = wad_mul(amount_wad_full, pool.acc_reward_per_weighted_share)?
+        .saturating_sub(user_stake.reward_debt);
+    let total_stranded_wad = max_pending_wad.saturating_sub(actual_pending_wad);
+
+    // For partial unstake, only return the proportion being unstaked
+    let stranded_wad = if amount == user_stake.amount {
+        total_stranded_wad
+    } else {
+        total_stranded_wad
+            .checked_mul(amount as u128)
+            .ok_or(StakingError::MathOverflow)?
+            / (user_stake.amount as u128)
+    };
+
+    let stranded_lamports = (stranded_wad / WAD) as u64;
+    if stranded_lamports > 0 {
+        pool.last_synced_lamports = pool.last_synced_lamports.saturating_sub(stranded_lamports);
+        msg!("Returned {} stranded lamports for redistribution", stranded_lamports);
     }
 
     // Calculate the unstaked portion's contribution to sum_stake_exp
