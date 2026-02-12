@@ -71,8 +71,13 @@ pub fn process_recover_stranded_rewards(
     let total_max_accumulated = wad_mul(total_staked_wad, pool.acc_reward_per_weighted_share)?;
     let total_max_pending = total_max_accumulated.saturating_sub(pool.total_reward_debt);
 
-    // Convert to lamports (truncate WAD fraction)
-    let total_owed_lamports = (total_max_pending / WAD) as u64;
+    // Convert to lamports (truncate WAD fraction), then add any SOL owed to
+    // residual claimants (users who fully unstaked but couldn't be fully paid).
+    // Residual debts are tracked separately because those users have amount=0
+    // and are not reflected in total_staked * acc_rps.
+    let active_owed_lamports = (total_max_pending / WAD) as u64;
+    let total_owed_lamports = active_owed_lamports
+        .saturating_add(pool.total_residual_unpaid);
 
     // Stranded = what the pool has synced minus what is actually owed at max weight
     let stranded = pool.last_synced_lamports.saturating_sub(total_owed_lamports);

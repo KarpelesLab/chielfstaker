@@ -159,8 +159,8 @@ pub fn process_claim_rewards(
     if is_residual_claim {
         // Residual claim (amount==0): reward_debt IS the unclaimed amount, so subtract
         user_stake.reward_debt = user_stake.reward_debt.saturating_sub(paid_wad);
-        // Pool aggregate decreases as the stored debt shrinks
-        pool.total_reward_debt = pool.total_reward_debt.saturating_sub(paid_wad);
+        // Residual debts are tracked in total_residual_unpaid (not total_reward_debt)
+        pool.total_residual_unpaid = pool.total_residual_unpaid.saturating_sub(transfer_amount);
     } else {
         // Normal claim: advance reward_debt by the amount actually paid out.
         // If pool has insufficient SOL, the unpaid portion remains claimable later.

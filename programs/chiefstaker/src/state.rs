@@ -81,8 +81,13 @@ pub struct StakingPool {
     /// Starts at 0 for existing pools (bootstraps conservatively — under-recovery is safe).
     pub total_reward_debt: u128,
 
-    /// Reserved space for future upgrades
-    pub _reserved3: [u8; 8],
+    /// Total lamports owed to residual claimants (users who fully unstaked
+    /// but couldn't be fully paid because the pool lacked SOL).
+    /// Tracked separately from `total_reward_debt` because residual users have
+    /// amount=0 (no allocation in `total_staked * acc_rps`), so including their
+    /// debt in `total_reward_debt` would break the RecoverStrandedRewards formula.
+    /// Starts at 0 for existing pools (binary-compatible with old `_reserved3`).
+    pub total_residual_unpaid: u64,
 }
 
 impl StakingPool {
@@ -105,7 +110,7 @@ impl StakingPool {
         8 +  // unstake_cooldown_seconds
         8 +  // initial_base_time
         16 + // total_reward_debt
-        8;   // _reserved3
+        8;   // total_residual_unpaid
 
     /// Create a new staking pool
     pub fn new(
@@ -136,7 +141,7 @@ impl StakingPool {
             unstake_cooldown_seconds: 0,
             initial_base_time: 0,
             total_reward_debt: 0,
-            _reserved3: [0u8; 8],
+            total_residual_unpaid: 0,
         }
     }
 

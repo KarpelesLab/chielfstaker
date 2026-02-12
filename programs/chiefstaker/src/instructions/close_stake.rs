@@ -10,6 +10,7 @@ use solana_program::{
 
 use crate::{
     error::StakingError,
+    math::WAD,
     state::{StakingPool, UserStake},
 };
 
@@ -74,11 +75,13 @@ pub fn process_close_stake_account(
     }
 
     // Account must be empty: no staked tokens, no pending unstake request,
-    // and no residual unclaimed rewards (reward_debt stores unclaimed WAD-scaled
-    // rewards after a full unstake when the pool lacked SOL).
+    // and no residual unclaimed rewards worth >= 1 lamport.
+    // reward_debt stores unclaimed WAD-scaled rewards after a full unstake
+    // when the pool lacked SOL. Sub-WAD dust (< 1 lamport) is forgiven
+    // to prevent permanent lock of the account.
     if user_stake.amount > 0
         || user_stake.has_pending_unstake_request()
-        || user_stake.reward_debt > 0
+        || user_stake.reward_debt / WAD > 0
     {
         return Err(StakingError::AccountNotEmpty.into());
     }

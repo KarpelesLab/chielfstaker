@@ -159,19 +159,33 @@ pub fn execute_unstake<'a>(
         let base_debt = wad_mul(remaining_amount_wad, pool.acc_reward_per_weighted_share)?;
         // Subtract unpaid rewards so they remain claimable
         user_stake.reward_debt = base_debt.saturating_sub(unpaid_rewards_wad);
+
+        // Update pool-level aggregate: subtract old, add new (saturating for bootstrapping)
+        pool.total_reward_debt = pool
+            .total_reward_debt
+            .saturating_sub(old_reward_debt)
+            .checked_add(user_stake.reward_debt)
+            .ok_or(StakingError::MathOverflow)?;
     } else {
         // Full unstake: preserve any unpaid rewards in reward_debt so the user
         // can claim them later via the amount==0 claim path. When amount==0,
         // reward_debt is reinterpreted as "unclaimed WAD-scaled rewards".
         user_stake.reward_debt = unpaid_rewards_wad;
-    }
 
-    // Update pool-level aggregate: subtract old, add new (saturating for bootstrapping)
-    pool.total_reward_debt = pool
-        .total_reward_debt
-        .saturating_sub(old_reward_debt)
-        .checked_add(user_stake.reward_debt)
-        .ok_or(StakingError::MathOverflow)?;
+        // Remove old debt from total_reward_debt but do NOT add the residual.
+        // Residual debts are tracked separately in total_residual_unpaid because
+        // the user's amount is 0 (no allocation in total_staked * acc_rps), and
+        // including them in total_reward_debt would break RecoverStrandedRewards.
+        pool.total_reward_debt = pool
+            .total_reward_debt
+            .saturating_sub(old_reward_debt);
+
+        let residual_lamports = (unpaid_rewards_wad / WAD) as u64;
+        pool.total_residual_unpaid = pool
+            .total_residual_unpaid
+            .checked_add(residual_lamports)
+            .ok_or(StakingError::MathOverflow)?;
+    }
 
     // Save states (before CPI — pool data includes pre-updated last_synced_lamports)
     {
