@@ -17,7 +17,7 @@ use spl_token_2022::extension::StateWithExtensions;
 use crate::{
     error::StakingError,
     math::{calculate_user_weighted_stake, exp_time_ratio, wad_mul, MAX_EXP_INPUT, U256, WAD},
-    state::{StakingPool, UserStake, STAKE_SEED},
+    state::{PoolMetadata, StakingPool, UserStake, STAKE_SEED},
 };
 
 /// Stake tokens into the pool
@@ -381,6 +381,25 @@ pub fn process_stake(
         **pool_info.try_borrow_mut_lamports()? -= auto_claim_transfer;
         **user_info.try_borrow_mut_lamports()? += auto_claim_transfer;
         msg!("Auto-claimed {} lamports in pending rewards", auto_claim_transfer);
+    }
+
+    // Optional metadata account: increment member_count on new stake
+    if is_new_stake {
+        if let Some(metadata_info) = account_info_iter.next() {
+            if metadata_info.owner == program_id && !metadata_info.data_is_empty() {
+                let (expected_metadata, _) =
+                    PoolMetadata::derive_pda(pool_info.key, program_id);
+                if *metadata_info.key == expected_metadata {
+                    let mut metadata =
+                        PoolMetadata::try_from_slice(&metadata_info.try_borrow_data()?)?;
+                    if metadata.is_initialized() && metadata.pool == *pool_info.key {
+                        metadata.member_count = metadata.member_count.saturating_add(1);
+                        let mut metadata_data = metadata_info.try_borrow_mut_data()?;
+                        metadata.serialize(&mut &mut metadata_data[..])?;
+                    }
+                }
+            }
+        }
     }
 
     msg!("Staked {} tokens", amount);

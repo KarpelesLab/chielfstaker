@@ -10,11 +10,13 @@ use crate::math::{exp_neg_time_ratio, wad_mul, U256};
 pub const POOL_SEED: &[u8] = b"pool";
 pub const STAKE_SEED: &[u8] = b"stake";
 pub const TOKEN_VAULT_SEED: &[u8] = b"token_vault";
+pub const METADATA_SEED: &[u8] = b"metadata";
 
 
 /// Account discriminators
 pub const POOL_DISCRIMINATOR: [u8; 8] = [0xc7, 0x5f, 0x7e, 0x2d, 0x3b, 0x1a, 0x9c, 0x4e];
 pub const USER_STAKE_DISCRIMINATOR: [u8; 8] = [0xa3, 0x8b, 0x5d, 0x2f, 0x7c, 0x4a, 0x1e, 0x9d];
+pub const METADATA_DISCRIMINATOR: [u8; 8] = [0xd4, 0x2a, 0x8f, 0x6b, 0x51, 0x3c, 0xe7, 0x90];
 
 /// Staking pool state account
 /// PDA: ["pool", mint]
@@ -325,6 +327,69 @@ impl UserStake {
     }
 }
 
+/// Pool metadata account for explorer display
+/// PDA: ["metadata", pool]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct PoolMetadata {
+    /// Discriminator for account type identification
+    pub discriminator: [u8; 8],
+
+    /// Back-reference to staking pool
+    pub pool: Pubkey,
+
+    /// Actual byte length of name
+    pub name_len: u8,
+
+    /// UTF-8 name, zero-padded
+    pub name: [u8; 64],
+
+    /// Number of active tags (max 8)
+    pub num_tags: u8,
+
+    /// Byte length of each tag
+    pub tag_lengths: [u8; 8],
+
+    /// UTF-8 tags, zero-padded
+    pub tags: [[u8; 32]; 8],
+
+    /// Actual byte length of url
+    pub url_len: u8,
+
+    /// UTF-8 URL, zero-padded
+    pub url: [u8; 128],
+
+    /// Active staker count
+    pub member_count: u64,
+
+    /// PDA bump seed
+    pub bump: u8,
+}
+
+impl PoolMetadata {
+    /// Size of the account in bytes
+    pub const LEN: usize = 8 +  // discriminator
+        32 + // pool
+        1 +  // name_len
+        64 + // name
+        1 +  // num_tags
+        8 +  // tag_lengths
+        256 + // tags (8 * 32)
+        1 +  // url_len
+        128 + // url
+        8 +  // member_count
+        1;   // bump
+
+    /// Derive metadata PDA
+    pub fn derive_pda(pool: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[METADATA_SEED, pool.as_ref()], program_id)
+    }
+
+    /// Check if metadata is initialized
+    pub fn is_initialized(&self) -> bool {
+        self.discriminator == METADATA_DISCRIMINATOR
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +408,26 @@ mod tests {
         );
         let serialized = borsh::to_vec(&pool).unwrap();
         assert_eq!(serialized.len(), StakingPool::LEN);
+    }
+
+    #[test]
+    fn test_pool_metadata_size() {
+        let metadata = PoolMetadata {
+            discriminator: METADATA_DISCRIMINATOR,
+            pool: Pubkey::default(),
+            name_len: 0,
+            name: [0u8; 64],
+            num_tags: 0,
+            tag_lengths: [0u8; 8],
+            tags: [[0u8; 32]; 8],
+            url_len: 0,
+            url: [0u8; 128],
+            member_count: 0,
+            bump: 255,
+        };
+        let serialized = borsh::to_vec(&metadata).unwrap();
+        assert_eq!(serialized.len(), PoolMetadata::LEN);
+        assert_eq!(PoolMetadata::LEN, 508);
     }
 
     #[test]

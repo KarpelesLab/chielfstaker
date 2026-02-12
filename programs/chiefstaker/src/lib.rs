@@ -173,6 +173,19 @@ pub enum StakingInstruction {
     /// Accounts:
     /// 0. `[writable]` Pool account
     RecoverStrandedRewards,
+
+    /// Set (create or update) pool metadata for explorer display (permissionless)
+    ///
+    /// Derives name from Token 2022 mint metadata extension, tags are fixed.
+    /// Creates the metadata PDA if it doesn't exist.
+    ///
+    /// Accounts:
+    /// 0. `[]` Pool account
+    /// 1. `[writable]` Metadata PDA (["metadata", pool])
+    /// 2. `[]` Token mint
+    /// 3. `[writable, signer]` Payer
+    /// 4. `[]` System program
+    SetPoolMetadata,
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -260,6 +273,10 @@ pub fn process_instruction(
         StakingInstruction::RecoverStrandedRewards => {
             msg!("Instruction: RecoverStrandedRewards");
             process_recover_stranded_rewards(program_id, accounts)
+        }
+        StakingInstruction::SetPoolMetadata => {
+            msg!("Instruction: SetPoolMetadata");
+            process_set_pool_metadata(program_id, accounts)
         }
     }
 }
