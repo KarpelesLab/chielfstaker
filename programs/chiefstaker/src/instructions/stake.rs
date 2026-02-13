@@ -233,7 +233,6 @@ pub fn process_stake(
         // Track any unpaid portion so it remains claimable after the stake update.
         // NOTE: Actual SOL transfer is deferred until after the token CPI to avoid
         // Solana's CPI balance check failure (same pattern as execute_unstake).
-        let mut unpaid_rewards_wad: u128 = 0;
         let user_weighted_before = calculate_user_weighted_stake(
             user_stake.amount,
             user_stake.exp_start_factor,
@@ -260,11 +259,7 @@ pub fn process_stake(
                         pool.last_synced_lamports =
                             pool.last_synced_lamports.saturating_sub(auto_claim_transfer);
                     }
-                    // Track unpaid portion so it remains claimable
-                    let paid_wad = (auto_claim_transfer as u128)
-                        .checked_mul(WAD)
-                        .ok_or(StakingError::MathOverflow)?;
-                    unpaid_rewards_wad = pending.saturating_sub(paid_wad);
+                    // Unpaid portion remains naturally visible via snapshot delta
                 }
             }
         }
@@ -305,13 +300,23 @@ pub fn process_stake(
         // Note: stake_time stays as original for weight calculation purposes
         user_stake.last_stake_time = current_time;
 
-        // Recalculate reward_debt using max weight (total_amount * WAD) to prevent reward theft.
-        // Subtract any unpaid rewards so they remain claimable.
-        let total_amount_wad = (total_amount as u128)
+        // Recalculate reward_debt: advance old snapshot by auto-claimed amount,
+        // then add new deposit's debt at current acc_rps.
+        // old_rd + paid_wad preserves immature rewards for the old position.
+        // new_stake_debt = new_amount * acc_rps starts the new deposit at current accumulator.
+        // Unpaid rewards remain naturally visible via the snapshot delta.
+        let claim_paid_wad = (auto_claim_transfer as u128)
             .checked_mul(WAD)
             .ok_or(StakingError::MathOverflow)?;
-        let base_debt = wad_mul(total_amount_wad, pool.acc_reward_per_weighted_share)?;
-        user_stake.reward_debt = base_debt.saturating_sub(unpaid_rewards_wad);
+        let new_stake_debt = wad_mul(
+            (amount as u128).checked_mul(WAD).ok_or(StakingError::MathOverflow)?,
+            pool.acc_reward_per_weighted_share,
+        )?;
+        user_stake.reward_debt = old_reward_debt
+            .checked_add(claim_paid_wad)
+            .ok_or(StakingError::MathOverflow)?
+            .checked_add(new_stake_debt)
+            .ok_or(StakingError::MathOverflow)?;
 
         // Update pool-level aggregate: subtract old, add new (saturating for bootstrapping)
         pool.total_reward_debt = pool

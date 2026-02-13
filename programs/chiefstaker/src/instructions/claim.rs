@@ -86,7 +86,6 @@ pub fn process_claim_rewards(
     // 1. amount > 0: normal claim using snapshot-delta formula
     // 2. amount == 0 with reward_debt > 0: residual rewards from full unstake
     //    (when pool lacked SOL at unstake time, unpaid rewards are stored in reward_debt)
-    let mut claim_user_weighted: u128 = 0;
     let (pending, is_residual_claim) = if user_stake.amount == 0 {
         // Post-full-unstake: reward_debt stores unclaimed WAD-scaled rewards
         if user_stake.reward_debt == 0 {
@@ -111,8 +110,6 @@ pub fn process_claim_rewards(
             pool.base_time,
             pool.tau_seconds,
         )?;
-        claim_user_weighted = user_weighted;
-
         if user_weighted == 0 {
             msg!("No rewards to claim (stake too new)");
             return Ok(());
@@ -169,33 +166,17 @@ pub fn process_claim_rewards(
         // Residual debts are tracked in total_residual_unpaid (not total_reward_debt)
         pool.total_residual_unpaid = pool.total_residual_unpaid.saturating_sub(transfer_amount);
     } else {
-        // Normal claim: advance snapshot based on how much was paid.
-        // reward_debt encodes snapshot as: reward_debt = wad_mul(amount_wad, snapshot)
-        let old_rd = user_stake.reward_debt;
-        let amount_wad = (user_stake.amount as u128)
-            .checked_mul(WAD)
+        // Normal claim: advance reward_debt by paid_wad.
+        // This advances the encoded snapshot by paid_wad / amount_wad, preserving
+        // access to immature rewards as the user's weight grows over time.
+        // (Resetting snapshot to acc_rps would forfeit the immature portion.)
+        user_stake.reward_debt = user_stake
+            .reward_debt
+            .checked_add(paid_wad)
             .ok_or(StakingError::MathOverflow)?;
-
-        if paid_wad >= pending {
-            // Full claim: reset snapshot to current acc_rps
-            user_stake.reward_debt = wad_mul(amount_wad, pool.acc_reward_per_weighted_share)?;
-        } else {
-            // Partial claim (pool had insufficient SOL): advance snapshot proportionally
-            // consumed_delta = paid_wad / user_weighted (how much of delta_rps was consumed)
-            let consumed_delta = wad_div(paid_wad, claim_user_weighted)?;
-            let old_snapshot = wad_div(old_rd, amount_wad)?;
-            let new_snapshot = old_snapshot
-                .checked_add(consumed_delta)
-                .ok_or(StakingError::MathOverflow)?
-                .min(pool.acc_reward_per_weighted_share);
-            user_stake.reward_debt = wad_mul(amount_wad, new_snapshot)?;
-        }
-
-        // Pool aggregate: subtract old, add new
         pool.total_reward_debt = pool
             .total_reward_debt
-            .saturating_sub(old_rd)
-            .checked_add(user_stake.reward_debt)
+            .checked_add(paid_wad)
             .ok_or(StakingError::MathOverflow)?;
     }
 

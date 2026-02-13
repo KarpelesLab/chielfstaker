@@ -115,23 +115,28 @@ pub fn execute_unstake<'a>(
         .checked_sub(amount)
         .ok_or(StakingError::MathUnderflow)?;
 
-    // Recalculate reward debt for remaining stake, preserving old snapshot
+    // Recalculate reward debt for remaining stake
     if user_stake.amount > 0 {
-        // Recover the snapshot from old reward_debt: snapshot = old_rd / original_amount_wad
-        // Note: user_stake.amount has already been decremented, so original = current + unstaked
+        // Advance old reward_debt by paid amount, then scale down to remaining proportion.
+        // This preserves the encoded snapshot while accounting for claimed rewards.
+        // Unpaid rewards remain naturally visible via the snapshot delta (no explicit subtraction).
+        let reward_paid_wad = (reward_transfer_amount as u128)
+            .checked_mul(WAD)
+            .ok_or(StakingError::MathOverflow)?;
+        let advanced_rd = old_reward_debt
+            .checked_add(reward_paid_wad)
+            .ok_or(StakingError::MathOverflow)?;
         let original_amount = (user_stake.amount as u128)
             .checked_add(amount as u128)
             .ok_or(StakingError::MathOverflow)?;
         let original_amount_wad = original_amount
             .checked_mul(WAD)
             .ok_or(StakingError::MathOverflow)?;
-        let snapshot = wad_div(old_reward_debt, original_amount_wad)?;
+        let new_snapshot = wad_div(advanced_rd, original_amount_wad)?;
         let remaining_amount_wad = (user_stake.amount as u128)
             .checked_mul(WAD)
             .ok_or(StakingError::MathOverflow)?;
-        // Re-encode snapshot for remaining amount, subtract unpaid so they remain claimable
-        user_stake.reward_debt = wad_mul(remaining_amount_wad, snapshot)?
-            .saturating_sub(unpaid_rewards_wad);
+        user_stake.reward_debt = wad_mul(remaining_amount_wad, new_snapshot)?;
 
         // Update pool-level aggregate: subtract old, add new (saturating for bootstrapping)
         pool.total_reward_debt = pool
