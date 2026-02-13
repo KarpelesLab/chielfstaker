@@ -1085,9 +1085,11 @@ async function runTests() {
     await ctx.claimRewards(user);
     const balanceAfter = await ctx.getBalance(user.publicKey);
 
-    // User should receive some rewards (minus tx fee)
+    // User should receive some rewards (payer covers tx fee, so diff = pure reward)
     // Due to time-weighted calculation, might be small if just staked
-    console.log(`    Reward claimed: ${balanceAfter - balanceBefore} lamports`);
+    const reward = balanceAfter - balanceBefore;
+    if (reward < 0) throw new Error(`Unexpected SOL loss: ${reward}`);
+    console.log(`    Reward claimed: ${reward} lamports`);
   });
 
   // Test: Unstake partial
@@ -1158,7 +1160,9 @@ async function runTests() {
     await ctx.claimRewards(user);
     const balanceAfter = await ctx.getBalance(user.publicKey);
 
-    console.log(`    Direct SOL reward claimed: ${balanceAfter - balanceBefore} lamports`);
+    const reward = balanceAfter - balanceBefore;
+    if (reward <= 0) throw new Error(`Expected positive reward from synced SOL, got: ${reward}`);
+    console.log(`    Direct SOL reward claimed: ${reward} lamports`);
   });
 
   // Test: Additional stake
@@ -1589,10 +1593,11 @@ async function runTests() {
     let newBal = await ctx.getBalance(newStaker.publicKey);
     try {
       await ctx.claimRewards(newStaker);
-    } catch (e) {
-      // Expected - insufficient rewards or 0 weight
+    } catch (e: any) {
+      if (!e.message?.includes('0xb')) throw e;
     }
-    const newReward1 = Math.max(0, (await ctx.getBalance(newStaker.publicKey)) - newBal);
+    const newReward1 = (await ctx.getBalance(newStaker.publicKey)) - newBal;
+    if (newReward1 < 0) throw new Error(`Unexpected SOL loss: ${newReward1}`);
 
     const total1 = oldReward1 + newReward1;
     const newShare1 = total1 > 0 ? (newReward1 * 100) / total1 : 0;
@@ -1664,17 +1669,18 @@ async function runTests() {
     try {
       await ctx.claimRewards(newStaker);
     } catch (e: any) {
-      // May fail if reward too small or weight is 0
-      console.log(`    New staker claim: ${e.message?.includes('0xb') ? 'insufficient (expected)' : e.message}`);
+      if (!e.message?.includes('0xb')) throw e;
+      console.log(`    New staker claim: insufficient (expected)`);
     }
     const newBalanceAfter = await ctx.getBalance(newStaker.publicKey);
-    const newReward = Math.max(0, newBalanceAfter - newBalanceBefore);
+    const newReward = newBalanceAfter - newBalanceBefore;
+    if (newReward < 0) throw new Error(`Unexpected SOL loss: ${newReward}`);
 
     console.log(`    Old staker (20s age) reward: ${oldReward} lamports`);
     console.log(`    New staker (~0 age) reward: ${newReward} lamports`);
 
     // Old staker should get significantly more
-    if (oldReward <= newReward && newReward > 0) {
+    if (oldReward <= newReward) {
       throw new Error(`Old staker should get more: old=${oldReward}, new=${newReward}`);
     }
 
@@ -2095,14 +2101,19 @@ async function runTests() {
     const balance2 = await ctx.getBalance(user.publicKey);
     try {
       await ctx.claimRewards(user);
-    } catch (e) {
-      // May fail with "no pending rewards"
+    } catch (e: any) {
+      if (!e.message?.includes('0xb')) throw e;
     }
     const reward2 = (await ctx.getBalance(user.publicKey)) - balance2;
     console.log(`    Second claim: ${reward2} lamports`);
 
+    // Second claim should be strictly less than first (diminishing returns)
+    if (reward2 >= reward1) {
+      throw new Error(`Possible double-claim: reward2 (${reward2}) >= reward1 (${reward1})`);
+    }
+
     // Conservation: total claimed must not exceed deposit
-    const totalClaimed = reward1 + reward2 + 10000; // +10000 for tx fees
+    const totalClaimed = reward1 + reward2;
     const depositAmount = LAMPORTS_PER_SOL;
     if (totalClaimed > depositAmount) {
       throw new Error(`Over-distribution: claimed ${totalClaimed} > deposited ${depositAmount}`);
@@ -2152,16 +2163,17 @@ async function runTests() {
     const cyclerBefore = await ctx.getBalance(cycler.publicKey);
     try {
       await ctx.claimRewards(cycler);
-    } catch (e) {
-      // May fail if weight is too low
+    } catch (e: any) {
+      if (!e.message?.includes('0xb')) throw e;
     }
-    const cyclerReward = Math.max(0, (await ctx.getBalance(cycler.publicKey)) - cyclerBefore);
+    const cyclerReward = (await ctx.getBalance(cycler.publicKey)) - cyclerBefore;
+    if (cyclerReward < 0) throw new Error(`Unexpected SOL loss: ${cyclerReward}`);
 
     console.log(`    Honest (held 10s): ${honestReward} lamports`);
     console.log(`    Cycler (reset weight): ${cyclerReward} lamports`);
 
     // Honest should get more since cycler reset their weight
-    if (honestReward <= cyclerReward && cyclerReward > 0) {
+    if (honestReward <= cyclerReward) {
       throw new Error(`Cycling should reset weight: honest=${honestReward}, cycler=${cyclerReward}`);
     }
   });
@@ -2273,8 +2285,11 @@ async function runTests() {
     const attackerBefore = await ctx.getBalance(attacker.publicKey);
     try {
       await ctx.claimRewards(attacker);
-    } catch (e) {}
-    const attackerReward = Math.max(0, (await ctx.getBalance(attacker.publicKey)) - attackerBefore);
+    } catch (e: any) {
+      if (!e.message?.includes('0xb')) throw e;
+    }
+    const attackerReward = (await ctx.getBalance(attacker.publicKey)) - attackerBefore;
+    if (attackerReward < 0) throw new Error(`Unexpected SOL loss: ${attackerReward}`);
 
     const total = honestReward + attackerReward;
     const honestShare = (honestReward * 100) / total;
@@ -2728,6 +2743,9 @@ async function runTests() {
     tx.sign(ctx.payer, user);
 
     const simulation = await connection.simulateTransaction(tx);
+    if (simulation.value.err) {
+      throw new Error(`Simulation failed: ${JSON.stringify(simulation.value.err)}`);
+    }
     const unitsUsed = simulation.value.unitsConsumed || 0;
 
     console.log(`    Claim instruction compute units: ${unitsUsed}`);
@@ -2791,8 +2809,8 @@ async function runTests() {
       const before = BigInt(await ctx.getBalance(user.publicKey));
       await op();
       const after = BigInt(await ctx.getBalance(user.publicKey));
-      // Reward = balance change + tx fee (5000 lamports)
-      const reward = after - before + BigInt(5000);
+      // Payer covers tx fee, so balance diff = pure reward
+      const reward = after - before;
       if (reward > BigInt(0)) {
         rewards[name] += reward;
       }
@@ -2995,7 +3013,7 @@ async function runTests() {
     await ctx.stake(staker1, token1, BigInt(500_000_000));
     let bal0After = BigInt(await ctx.getBalance(staker1.publicKey));
     // Additional stake auto-claims rewards — track that SOL
-    totalClaimed += (bal0After - bal0 + BigInt(5000));
+    totalClaimed += (bal0After - bal0);
 
     // Wait for more weight accumulation
     console.log('    Waiting 10s for more weight...');
@@ -3013,23 +3031,23 @@ async function runTests() {
     let bal = BigInt(await ctx.getBalance(staker1.publicKey));
     await ctx.claimRewards(staker1);
     let balAfter = BigInt(await ctx.getBalance(staker1.publicKey));
-    totalClaimed += (balAfter - bal + BigInt(5000)); // +5000 for tx fee
+    totalClaimed += (balAfter - bal);
 
     bal = BigInt(await ctx.getBalance(staker1.publicKey));
     await ctx.unstake(staker1, token1, BigInt(1_500_000_000));
     balAfter = BigInt(await ctx.getBalance(staker1.publicKey));
-    totalClaimed += (balAfter - bal + BigInt(5000)); // reward portion from unstake
+    totalClaimed += (balAfter - bal); // reward portion from unstake
 
     // Staker2: claim + unstake
     bal = BigInt(await ctx.getBalance(staker2.publicKey));
     await ctx.claimRewards(staker2);
     balAfter = BigInt(await ctx.getBalance(staker2.publicKey));
-    totalClaimed += (balAfter - bal + BigInt(5000));
+    totalClaimed += (balAfter - bal);
 
     bal = BigInt(await ctx.getBalance(staker2.publicKey));
     await ctx.unstake(staker2, token2, BigInt(1_000_000_000));
     balAfter = BigInt(await ctx.getBalance(staker2.publicKey));
-    totalClaimed += (balAfter - bal + BigInt(5000));
+    totalClaimed += (balAfter - bal);
 
     // Check pool remaining
     const poolBalance = BigInt(await ctx.getBalance(ctx.poolPDA));
@@ -3106,7 +3124,7 @@ async function runTests() {
     const balBefore = BigInt(await ctx.getBalance(staker.publicKey));
     await ctx.claimRewards(staker);
     const balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-    const claimed = balAfter - balBefore + BigInt(5000); // +fee
+    const claimed = balAfter - balBefore;
 
     console.log(`    Deposited: ${depositAmount}, Claimed: ${claimed}`);
 
@@ -3289,8 +3307,8 @@ async function runTests() {
     let autoClaimBal = BigInt(await ctx.getBalance(stakers[0].publicKey));
     await ctx.stake(stakers[0], tokens[0], BigInt(500_000_000));
     let autoClaimBalAfter = BigInt(await ctx.getBalance(stakers[0].publicKey));
-    let autoClaimedSOL = autoClaimBalAfter - autoClaimBal + BigInt(5000); // +5000 for tx fee
-    if (autoClaimedSOL < BigInt(0)) autoClaimedSOL = BigInt(0);
+    let autoClaimedSOL = autoClaimBalAfter - autoClaimBal;
+    if (autoClaimedSOL < BigInt(0)) throw new Error(`Unexpected SOL loss on auto-claim: ${autoClaimedSOL}`);
 
     // Phase 2: more deposits
     await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
@@ -3308,9 +3326,9 @@ async function runTests() {
     for (let i = 0; i < numStakers; i++) {
       // Claim
       const bal = BigInt(await ctx.getBalance(stakers[i].publicKey));
-      try { await ctx.claimRewards(stakers[i]); } catch (e) { /* may have no pending */ }
+      try { await ctx.claimRewards(stakers[i]); } catch (e: any) { if (!e.message?.includes('0xb')) throw e; }
       const balAfterClaim = BigInt(await ctx.getBalance(stakers[i].publicKey));
-      totalClaimed += (balAfterClaim - bal + BigInt(5000));
+      totalClaimed += (balAfterClaim - bal);
 
       // Unstake — get the staked amount
       const stakeAmount = i === 0
@@ -3320,7 +3338,7 @@ async function runTests() {
       await ctx.unstake(stakers[i], tokens[i], stakeAmount);
       const balAfterUnstake = BigInt(await ctx.getBalance(stakers[i].publicKey));
       // Count only the reward portion of unstake (unstake also claims rewards)
-      totalClaimed += (balAfterUnstake - balBeforeUnstake + BigInt(5000));
+      totalClaimed += (balAfterUnstake - balBeforeUnstake);
     }
 
     const poolBalance = BigInt(await ctx.getBalance(ctx.poolPDA));
@@ -3765,8 +3783,9 @@ async function runTests() {
     const multiBal2 = await ctx.getBalance(multiClaimer.publicKey);
     try {
       await ctx.claimRewards(multiClaimer);
-    } catch (e) { /* may fail if delta rounds to 0 */ }
-    const multiReward2 = Math.max(0, (await ctx.getBalance(multiClaimer.publicKey)) - multiBal2);
+    } catch (e: any) { if (!e.message?.includes('0xb')) throw e; }
+    const multiReward2 = (await ctx.getBalance(multiClaimer.publicKey)) - multiBal2;
+    if (multiReward2 < 0) throw new Error(`Unexpected SOL loss: ${multiReward2}`);
 
     // Single-claimer claims once at 20s age
     const singleBal = await ctx.getBalance(singleClaimer.publicKey);
@@ -3944,7 +3963,7 @@ async function runTests() {
     const balBefore = BigInt(await ctx.getBalance(user.publicKey));
     await ctx.claimRewards(user);
     const balAfter = BigInt(await ctx.getBalance(user.publicKey));
-    const claimed = balAfter - balBefore + BigInt(5000); // +5000 for tx fee
+    const claimed = balAfter - balBefore;
     console.log(`    Claimed: ${claimed} lamports`);
 
     if (claimed > depositAmount) {
@@ -3997,7 +4016,7 @@ async function runTests() {
       // Claim may fail if entitlement is 0
     }
     const bal1After = BigInt(await ctx.getBalance(user1.publicKey));
-    const claim1 = bal1After - bal1Before + BigInt(5000);
+    const claim1 = bal1After - bal1Before;
     if (claim1 > BigInt(0)) totalClaimed += claim1;
     console.log(`    User1 claimed: ${claim1} lamports`);
 
@@ -4009,7 +4028,7 @@ async function runTests() {
       console.log('    User2 claim failed (expected if pool drained)');
     }
     const bal2After = BigInt(await ctx.getBalance(user2.publicKey));
-    const claim2 = bal2After - bal2Before + BigInt(5000);
+    const claim2 = bal2After - bal2Before;
     if (claim2 > BigInt(0)) totalClaimed += claim2;
     console.log(`    User2 claimed: ${claim2} lamports`);
 
@@ -4066,7 +4085,7 @@ async function runTests() {
     const honestBalBefore = BigInt(await ctx.getBalance(honest.publicKey));
     await ctx.claimRewards(honest);
     const honestBalAfter = BigInt(await ctx.getBalance(honest.publicKey));
-    const honestClaimed = honestBalAfter - honestBalBefore + BigInt(5000);
+    const honestClaimed = honestBalAfter - honestBalBefore;
 
     let attackerClaimed = BigInt(0);
     const attackerBalBefore = BigInt(await ctx.getBalance(attacker.publicKey));
@@ -4076,7 +4095,7 @@ async function runTests() {
       console.log('    Attacker claim failed (expected — zero weight)');
     }
     const attackerBalAfter = BigInt(await ctx.getBalance(attacker.publicKey));
-    attackerClaimed = attackerBalAfter - attackerBalBefore + BigInt(5000);
+    attackerClaimed = attackerBalAfter - attackerBalBefore;
 
     const totalClaimed = (honestClaimed > BigInt(0) ? honestClaimed : BigInt(0))
                        + (attackerClaimed > BigInt(0) ? attackerClaimed : BigInt(0));
