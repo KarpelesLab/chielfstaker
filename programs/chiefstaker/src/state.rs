@@ -1,7 +1,7 @@
 //! Account state structures for the staking program
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use solana_program::pubkey::Pubkey;
+use solana_program::{account_info::AccountInfo, pubkey::Pubkey, sysvar::Sysvar};
 
 use crate::error::StakingError;
 use crate::math::{exp_neg_time_ratio, wad_mul, U256};
@@ -181,7 +181,7 @@ impl StakingPool {
 
 /// User stake account
 /// PDA: ["stake", pool, owner]
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+#[derive(BorshSerialize, Debug, Clone)]
 pub struct UserStake {
     /// Discriminator for account type identification
     pub discriminator: [u8; 8],
@@ -225,6 +225,10 @@ pub struct UserStake {
     /// 0 = legacy account (pre-rebase-aware); treated as matching the pool's
     /// initial_base_time or current base_time if no rebase has occurred.
     pub base_time_snapshot: i64,
+
+    /// Cumulative SOL rewards claimed by this user (lamports).
+    /// Defaults to 0 for legacy 153-byte accounts (populated on first realloc).
+    pub total_rewards_claimed: u64,
 }
 
 impl UserStake {
@@ -240,7 +244,11 @@ impl UserStake {
         8 +  // unstake_request_amount
         8 +  // unstake_request_time
         8 +  // last_stake_time
-        8;   // base_time_snapshot
+        8 +  // base_time_snapshot
+        8;   // total_rewards_claimed
+
+    /// Legacy account size (before total_rewards_claimed was added)
+    pub const LEGACY_LEN: usize = Self::LEN - 8;
 
     /// Create a new user stake
     pub fn new(
@@ -265,6 +273,7 @@ impl UserStake {
             unstake_request_time: 0,
             last_stake_time: stake_time,
             base_time_snapshot,
+            total_rewards_claimed: 0,
         }
     }
 
@@ -326,6 +335,70 @@ impl UserStake {
         }
         self.base_time_snapshot = pool.base_time;
         Ok(true)
+    }
+}
+
+impl BorshDeserialize for UserStake {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let discriminator = <[u8; 8]>::deserialize_reader(reader)?;
+        let owner = Pubkey::deserialize_reader(reader)?;
+        let pool = Pubkey::deserialize_reader(reader)?;
+        let amount = u64::deserialize_reader(reader)?;
+        let stake_time = i64::deserialize_reader(reader)?;
+        let exp_start_factor = u128::deserialize_reader(reader)?;
+        let reward_debt = u128::deserialize_reader(reader)?;
+        let bump = u8::deserialize_reader(reader)?;
+        let unstake_request_amount = u64::deserialize_reader(reader)?;
+        let unstake_request_time = i64::deserialize_reader(reader)?;
+        let last_stake_time = i64::deserialize_reader(reader)?;
+        let base_time_snapshot = i64::deserialize_reader(reader)?;
+
+        // New field — may not be present in legacy 153-byte accounts
+        let total_rewards_claimed = u64::deserialize_reader(reader).unwrap_or(0);
+
+        Ok(Self {
+            discriminator,
+            owner,
+            pool,
+            amount,
+            stake_time,
+            exp_start_factor,
+            reward_debt,
+            bump,
+            unstake_request_amount,
+            unstake_request_time,
+            last_stake_time,
+            base_time_snapshot,
+            total_rewards_claimed,
+        })
+    }
+}
+
+impl UserStake {
+    /// Realloc account to current LEN if it's a legacy (smaller) account.
+    /// Transfers additional rent from payer to the account via direct lamport manipulation.
+    /// No-op if account is already at or above current LEN.
+    pub fn maybe_realloc<'a>(
+        account: &AccountInfo<'a>,
+        payer: &AccountInfo<'a>,
+    ) -> Result<(), solana_program::program_error::ProgramError> {
+        if account.data_len() >= Self::LEN {
+            return Ok(());
+        }
+
+        let rent = solana_program::rent::Rent::get()?;
+        let new_rent = rent.minimum_balance(Self::LEN);
+        let old_rent = rent.minimum_balance(account.data_len());
+        let rent_delta = new_rent.saturating_sub(old_rent);
+
+        if rent_delta > 0 {
+            **payer.try_borrow_mut_lamports()? -= rent_delta;
+            **account.try_borrow_mut_lamports()? += rent_delta;
+        }
+
+        account.realloc(Self::LEN, false)?;
+
+        Ok(())
     }
 }
 
@@ -445,5 +518,52 @@ mod tests {
         );
         let serialized = borsh::to_vec(&stake).unwrap();
         assert_eq!(serialized.len(), UserStake::LEN);
+        assert_eq!(UserStake::LEN, 161);
+        assert_eq!(UserStake::LEGACY_LEN, 153);
+    }
+
+    #[test]
+    fn test_user_stake_legacy_deserialize() {
+        // Create a new stake and serialize it
+        let stake = UserStake::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            1000,
+            12345,
+            1_000_000_000_000_000_000,
+            255,
+            12345,
+        );
+        let full = borsh::to_vec(&stake).unwrap();
+
+        // Truncate to legacy 153 bytes (no total_rewards_claimed)
+        let legacy = &full[..UserStake::LEGACY_LEN];
+
+        // Deserialize should succeed with total_rewards_claimed defaulting to 0
+        let deserialized = UserStake::try_from_slice(legacy).unwrap();
+        assert_eq!(deserialized.amount, 1000);
+        assert_eq!(deserialized.total_rewards_claimed, 0);
+        assert_eq!(deserialized.bump, 255);
+
+        // Full 161-byte deserialization should also work
+        let deserialized_full = UserStake::try_from_slice(&full).unwrap();
+        assert_eq!(deserialized_full.total_rewards_claimed, 0);
+    }
+
+    #[test]
+    fn test_user_stake_total_rewards_roundtrip() {
+        let mut stake = UserStake::new(
+            Pubkey::default(),
+            Pubkey::default(),
+            1000,
+            12345,
+            1_000_000_000_000_000_000,
+            255,
+            12345,
+        );
+        stake.total_rewards_claimed = 999_999;
+        let serialized = borsh::to_vec(&stake).unwrap();
+        let deserialized = UserStake::try_from_slice(&serialized).unwrap();
+        assert_eq!(deserialized.total_rewards_claimed, 999_999);
     }
 }

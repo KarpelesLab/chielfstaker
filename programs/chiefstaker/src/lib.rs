@@ -16,6 +16,7 @@ use solana_program::{
 };
 
 pub mod error;
+pub mod events;
 pub mod instructions;
 pub mod math;
 pub mod state;

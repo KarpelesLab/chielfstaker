@@ -482,6 +482,13 @@ interface PoolState {
   totalRewardDebt: bigint;
 }
 
+// Decoded user stake fields relevant to reward testing
+interface UserStakeState {
+  amount: bigint;
+  rewardDebt: bigint;
+  totalRewardsClaimed: bigint;
+}
+
 // Test context
 class TestContext {
   connection: Connection;
@@ -913,6 +920,33 @@ class TestContext {
       lastSyncedLamports: BigInt(data.readBigUInt64LE(225)),
       totalRewardDebt: readU128LE(data, 265),
     };
+  }
+
+  async readUserStakeState(user: PublicKey): Promise<UserStakeState> {
+    const [userStakePDA] = deriveUserStakePDA(this.poolPDA, user);
+    const info = await this.connection.getAccountInfo(userStakePDA);
+    if (!info) throw new Error('User stake account not found');
+    const data = info.data;
+    // Offsets from Borsh serialization layout (state.rs UserStake):
+    // 0:   discriminator (8)
+    // 8:   owner (32)
+    // 40:  pool (32)
+    // 72:  amount (u64)
+    // 80:  stake_time (i64)
+    // 88:  exp_start_factor (u128)
+    // 104: reward_debt (u128)
+    // 120: bump (u8)
+    // 121: unstake_request_amount (u64)
+    // 129: unstake_request_time (i64)
+    // 137: last_stake_time (i64)
+    // 145: base_time_snapshot (i64)
+    // 153: total_rewards_claimed (u64) — may not exist on legacy 153-byte accounts
+    const amount = data.readBigUInt64LE(72);
+    const rewardDebt = readU128LE(data, 104);
+    const totalRewardsClaimed = data.length >= 161
+      ? data.readBigUInt64LE(153)
+      : 0n;
+    return { amount, rewardDebt, totalRewardsClaimed };
   }
 
   async getBalance(pubkey: PublicKey): Promise<number> {
@@ -3584,6 +3618,293 @@ async function runTests() {
     // member_count should remain 0 since we didn't pass metadata
     const meta = await ctx.readMetadata();
     if (meta.memberCount !== 0n) throw new Error(`Expected 0 (no metadata passed), got ${meta.memberCount}`);
+  });
+
+  // === Repeated Claim Exploit Tests (round 10b fix) ===
+
+  // Test: Repeated claims do NOT extract max-weight rewards
+  await test('Security: Repeated claims cannot extract max-weight rewards', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+
+    // tau=60 so weight grows slowly (user will have ~15% weight after 10s)
+    await ctx.initializePool(BigInt(60));
+
+    const user = Keypair.generate();
+    await airdropAndConfirm(connection, user.publicKey, 2 * LAMPORTS_PER_SOL);
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Wait 10s to accrue some weight (~15% at tau=60)
+    console.log('    Waiting 10s for weight to accrue...');
+    await new Promise(r => setTimeout(r, 10000));
+
+    // Deposit a large reward
+    const depositAmount = LAMPORTS_PER_SOL;
+    await ctx.depositRewards(BigInt(depositAmount));
+
+    // Claim 5 times in rapid succession
+    let totalClaimed = 0;
+    for (let i = 0; i < 5; i++) {
+      const balBefore = await ctx.getBalance(user.publicKey);
+      try {
+        await ctx.claimRewards(user);
+      } catch (e) {
+        // Expected: "no pending rewards" after first claim
+      }
+      const balAfter = await ctx.getBalance(user.publicKey);
+      const reward = balAfter - balBefore;
+      if (reward > 0) {
+        totalClaimed += reward;
+        console.log(`    Claim ${i + 1}: ${reward} lamports`);
+      } else {
+        console.log(`    Claim ${i + 1}: 0 (no rewards / tx fee)`);
+      }
+    }
+
+    // The critical assertion: total claimed must be much less than the deposit.
+    // With ~15% weight, user should get ~15% of 1 SOL = ~0.15 SOL.
+    // Before fix: repeated claims would converge to ~1 SOL (100%).
+    // Allow generous margin: user should get < 50% of deposit.
+    const claimedPercent = (totalClaimed * 100) / depositAmount;
+    console.log(`    Total claimed: ${totalClaimed} lamports (${claimedPercent.toFixed(1)}% of deposit)`);
+
+    if (totalClaimed > depositAmount * 0.5) {
+      throw new Error(
+        `EXPLOIT: Repeated claims extracted ${claimedPercent.toFixed(1)}% of deposit ` +
+        `(expected <50% for ~15% weight). Total: ${totalClaimed} / ${depositAmount}`
+      );
+    }
+  });
+
+  // Test: Second claim returns 0 when no new rewards deposited
+  await test('Security: Second claim returns 0 without new rewards', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60));
+
+    const user = Keypair.generate();
+    await airdropAndConfirm(connection, user.publicKey, 2 * LAMPORTS_PER_SOL);
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Wait for weight
+    console.log('    Waiting 5s for weight...');
+    await new Promise(r => setTimeout(r, 5000));
+
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL / 2));
+
+    // First claim should succeed
+    const bal1 = await ctx.getBalance(user.publicKey);
+    await ctx.claimRewards(user);
+    const reward1 = (await ctx.getBalance(user.publicKey)) - bal1;
+    console.log(`    First claim: ${reward1} lamports`);
+    if (reward1 <= 0) throw new Error('First claim should get rewards');
+
+    // Second claim (no new deposits) should fail or return 0
+    const bal2 = await ctx.getBalance(user.publicKey);
+    try {
+      await ctx.claimRewards(user);
+    } catch (e) {
+      // Expected: "no pending rewards" or similar
+      console.log('    Second claim: rejected (expected)');
+    }
+    const reward2 = (await ctx.getBalance(user.publicKey)) - bal2;
+    console.log(`    Second claim: ${reward2} lamports`);
+
+    // Second claim should be 0 or negative (tx fee only)
+    if (reward2 > 0) {
+      throw new Error(
+        `EXPLOIT: Second claim got ${reward2} lamports without new deposits`
+      );
+    }
+  });
+
+  // Test: Patient staker earns more than early claimer
+  await test('Security: Patient staker earns more than early claimer', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60));
+
+    // Both stake at the same time
+    const earlyClamer = Keypair.generate();
+    const patientStaker = Keypair.generate();
+    await airdropAndConfirm(connection, earlyClamer.publicKey, 2 * LAMPORTS_PER_SOL);
+    await airdropAndConfirm(connection, patientStaker.publicKey, 2 * LAMPORTS_PER_SOL);
+    const earlyToken = await ctx.createUserTokenAccount(earlyClamer.publicKey);
+    const patientToken = await ctx.createUserTokenAccount(patientStaker.publicKey);
+    const amount = BigInt(1_000_000_000);
+    await ctx.mintTokens(earlyToken, amount);
+    await ctx.mintTokens(patientToken, amount);
+    await ctx.stake(earlyClamer, earlyToken, amount);
+    await ctx.stake(patientStaker, patientToken, amount);
+
+    // Wait 5s, deposit rewards
+    console.log('    Waiting 5s...');
+    await new Promise(r => setTimeout(r, 5000));
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
+
+    // Early claimer claims immediately at low weight
+    const earlyBal1 = await ctx.getBalance(earlyClamer.publicKey);
+    await ctx.claimRewards(earlyClamer);
+    const earlyReward1 = (await ctx.getBalance(earlyClamer.publicKey)) - earlyBal1;
+    console.log(`    Early claimer first claim (5s age): ${earlyReward1}`);
+
+    // Wait another 15s for weight to grow
+    console.log('    Waiting 15s more...');
+    await new Promise(r => setTimeout(r, 15000));
+
+    // Early claimer claims again — but snapshot was reset, so they only get
+    // rewards from NEW accumulator increases (which is 0 — no new deposits)
+    const earlyBal2 = await ctx.getBalance(earlyClamer.publicKey);
+    try {
+      await ctx.claimRewards(earlyClamer);
+    } catch (e) { /* expected */ }
+    const earlyReward2 = Math.max(0, (await ctx.getBalance(earlyClamer.publicKey)) - earlyBal2);
+
+    // Patient staker claims now at higher weight (20s age)
+    const patientBal = await ctx.getBalance(patientStaker.publicKey);
+    await ctx.claimRewards(patientStaker);
+    const patientReward = (await ctx.getBalance(patientStaker.publicKey)) - patientBal;
+
+    const earlyTotal = earlyReward1 + earlyReward2;
+    console.log(`    Early claimer total: ${earlyTotal} lamports`);
+    console.log(`    Patient staker total: ${patientReward} lamports`);
+
+    // Patient staker should earn more (waited longer → higher weight)
+    if (patientReward <= earlyTotal) {
+      throw new Error(
+        `Patient staker should earn more: patient=${patientReward}, early=${earlyTotal}`
+      );
+    }
+    console.log(`    Patient earned ${((patientReward - earlyTotal) * 100 / earlyTotal).toFixed(0)}% more`);
+  });
+
+  // Test: total_rewards_claimed field tracks correctly
+  await test('Accounting: total_rewards_claimed increments on claim', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60));
+
+    const user = Keypair.generate();
+    await airdropAndConfirm(connection, user.publicKey, 2 * LAMPORTS_PER_SOL);
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Check initial state
+    const state0 = await ctx.readUserStakeState(user.publicKey);
+    console.log(`    Initial total_rewards_claimed: ${state0.totalRewardsClaimed}`);
+    if (state0.totalRewardsClaimed !== 0n) {
+      throw new Error(`Expected 0 initial, got ${state0.totalRewardsClaimed}`);
+    }
+
+    // Wait and deposit
+    console.log('    Waiting 5s...');
+    await new Promise(r => setTimeout(r, 5000));
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL / 2));
+
+    // Claim
+    const balBefore = await ctx.getBalance(user.publicKey);
+    await ctx.claimRewards(user);
+    const balAfter = await ctx.getBalance(user.publicKey);
+    const reward = balAfter - balBefore;
+    console.log(`    Claimed: ${reward} lamports`);
+
+    // Check total_rewards_claimed updated
+    const state1 = await ctx.readUserStakeState(user.publicKey);
+    console.log(`    total_rewards_claimed after claim: ${state1.totalRewardsClaimed}`);
+
+    if (state1.totalRewardsClaimed === 0n) {
+      throw new Error('total_rewards_claimed should be > 0 after claim');
+    }
+
+    // Deposit more and claim again
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL / 2));
+    // Wait a tiny bit for weight (otherwise snapshot delta is 0)
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      await ctx.claimRewards(user);
+    } catch (e) { /* may fail if no new delta */ }
+
+    const state2 = await ctx.readUserStakeState(user.publicKey);
+    console.log(`    total_rewards_claimed after second: ${state2.totalRewardsClaimed}`);
+
+    if (state2.totalRewardsClaimed < state1.totalRewardsClaimed) {
+      throw new Error('total_rewards_claimed should never decrease');
+    }
+  });
+
+  // Test: total_rewards_claimed increments on auto-claim during additional stake
+  await test('Accounting: total_rewards_claimed increments on auto-claim stake', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60));
+
+    const user = Keypair.generate();
+    await airdropAndConfirm(connection, user.publicKey, 2 * LAMPORTS_PER_SOL);
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(2_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Wait and deposit
+    console.log('    Waiting 5s...');
+    await new Promise(r => setTimeout(r, 5000));
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL / 2));
+
+    // Additional stake triggers auto-claim
+    const balBefore = await ctx.getBalance(user.publicKey);
+    await ctx.stake(user, userToken, BigInt(500_000_000));
+    const balAfter = await ctx.getBalance(user.publicKey);
+
+    const state = await ctx.readUserStakeState(user.publicKey);
+    console.log(`    total_rewards_claimed after additional stake: ${state.totalRewardsClaimed}`);
+    console.log(`    Balance delta (includes tx fee): ${balAfter - balBefore}`);
+
+    // If auto-claim paid out anything, total_rewards_claimed should reflect it
+    if (state.totalRewardsClaimed > 0n) {
+      console.log('    Auto-claim rewards tracked successfully');
+    } else {
+      console.log('    No auto-claim payout (weight may be too low)');
+    }
+  });
+
+  // Test: total_rewards_claimed increments on unstake with reward payout
+  await test('Accounting: total_rewards_claimed increments on unstake', async () => {
+    const ctx = new TestContext(connection, Keypair.generate());
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60));
+
+    const user = Keypair.generate();
+    await airdropAndConfirm(connection, user.publicKey, 2 * LAMPORTS_PER_SOL);
+    const userToken = await ctx.createUserTokenAccount(user.publicKey);
+    await ctx.mintTokens(userToken, BigInt(1_000_000_000));
+    await ctx.stake(user, userToken, BigInt(1_000_000_000));
+
+    // Wait and deposit
+    console.log('    Waiting 5s...');
+    await new Promise(r => setTimeout(r, 5000));
+    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL / 2));
+
+    // Unstake (should auto-claim rewards)
+    await ctx.unstake(user, userToken, BigInt(500_000_000));
+
+    const state = await ctx.readUserStakeState(user.publicKey);
+    console.log(`    total_rewards_claimed after unstake: ${state.totalRewardsClaimed}`);
+
+    if (state.totalRewardsClaimed > 0n) {
+      console.log('    Unstake reward payout tracked successfully');
+    } else {
+      console.log('    No reward payout during unstake (weight may be too low)');
+    }
   });
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

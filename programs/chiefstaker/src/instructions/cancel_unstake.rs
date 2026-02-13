@@ -49,6 +49,9 @@ pub fn process_cancel_unstake_request(
         return Err(StakingError::InvalidPDA.into());
     }
 
+    // Realloc legacy accounts to current size (payer = user)
+    UserStake::maybe_realloc(user_stake_info, user_info)?;
+
     // Load and validate user stake
     if user_stake_info.owner != program_id {
         return Err(StakingError::InvalidAccountOwner.into());

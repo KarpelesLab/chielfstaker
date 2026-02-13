@@ -13,6 +13,7 @@ use solana_program::{
 
 use crate::{
     error::StakingError,
+    events::{emit_reward_payout, RewardPayoutType},
     math::{calculate_user_weighted_stake, wad_div, wad_mul, WAD},
     state::{StakingPool, UserStake},
 };
@@ -57,6 +58,9 @@ pub fn process_claim_rewards(
     if pool.get_sum_stake_exp().needs_rebase() {
         return Err(StakingError::PoolRequiresSync.into());
     }
+
+    // Realloc legacy accounts to current size (payer = user)
+    UserStake::maybe_realloc(user_stake_info, user_info)?;
 
     // Load and validate user stake
     if user_stake_info.owner != program_id {
@@ -166,22 +170,29 @@ pub fn process_claim_rewards(
         // Residual debts are tracked in total_residual_unpaid (not total_reward_debt)
         pool.total_residual_unpaid = pool.total_residual_unpaid.saturating_sub(transfer_amount);
     } else {
-        // Normal claim: advance reward_debt by paid_wad.
-        // This advances the encoded snapshot by paid_wad / amount_wad, preserving
-        // access to immature rewards as the user's weight grows over time.
-        // (Resetting snapshot to acc_rps would forfeit the immature portion.)
-        user_stake.reward_debt = user_stake
-            .reward_debt
-            .checked_add(paid_wad)
+        // Normal claim: reset snapshot to current acc_rps.
+        // The user claimed their weighted share of the acc_rps range up to now.
+        // The immature portion (max_weight - actual_weight allocation) stays in the
+        // pool as stranded rewards, redistributed via RecoverStrandedRewards.
+        // NOT advancing incrementally — that allows repeated claims to extract the
+        // full max-weight amount (geometric series: w + w(1-w) + w(1-w)^2 + ... = 1).
+        let old_reward_debt = user_stake.reward_debt;
+        let amount_wad = (user_stake.amount as u128)
+            .checked_mul(WAD)
             .ok_or(StakingError::MathOverflow)?;
+        user_stake.reward_debt = wad_mul(amount_wad, pool.acc_reward_per_weighted_share)?;
         pool.total_reward_debt = pool
             .total_reward_debt
-            .checked_add(paid_wad)
+            .saturating_sub(old_reward_debt)
+            .checked_add(user_stake.reward_debt)
             .ok_or(StakingError::MathOverflow)?;
     }
 
     // Update last_synced_lamports so sync_rewards doesn't miss new deposits
     pool.last_synced_lamports = pool.last_synced_lamports.saturating_sub(transfer_amount);
+
+    // Increment cumulative rewards counter
+    user_stake.total_rewards_claimed = user_stake.total_rewards_claimed.saturating_add(transfer_amount);
 
     // Save user stake
     {
@@ -200,6 +211,8 @@ pub fn process_claim_rewards(
     } else {
         msg!("Claimed {} lamports in rewards", transfer_amount);
     }
+
+    emit_reward_payout(pool_info.key, user_info.key, transfer_amount, RewardPayoutType::Claim);
 
     Ok(())
 }

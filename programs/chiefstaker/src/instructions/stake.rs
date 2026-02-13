@@ -16,6 +16,7 @@ use spl_token_2022::extension::StateWithExtensions;
 
 use crate::{
     error::StakingError,
+    events::{emit_reward_payout, RewardPayoutType},
     math::{calculate_user_weighted_stake, exp_time_ratio, wad_div, wad_mul, MAX_EXP_INPUT, U256, WAD},
     state::{PoolMetadata, StakingPool, UserStake, STAKE_SEED},
 };
@@ -192,6 +193,9 @@ pub fn process_stake(
             .ok_or(StakingError::MathOverflow)?;
         pool.set_sum_stake_exp(new_sum);
     } else {
+        // Realloc legacy accounts to current size (payer = user)
+        UserStake::maybe_realloc(user_stake_info, user_info)?;
+
         // Load existing stake
         if user_stake_info.owner != program_id {
             return Err(StakingError::InvalidAccountOwner.into());
@@ -300,23 +304,13 @@ pub fn process_stake(
         // Note: stake_time stays as original for weight calculation purposes
         user_stake.last_stake_time = current_time;
 
-        // Recalculate reward_debt: advance old snapshot by auto-claimed amount,
-        // then add new deposit's debt at current acc_rps.
-        // old_rd + paid_wad preserves immature rewards for the old position.
-        // new_stake_debt = new_amount * acc_rps starts the new deposit at current accumulator.
-        // Unpaid rewards remain naturally visible via the snapshot delta.
-        let claim_paid_wad = (auto_claim_transfer as u128)
+        // Reset snapshot to current acc_rps for the combined position.
+        // Same rationale as claim: prevents repeated-stake exploit from extracting
+        // max-weight rewards via geometric series on the old position.
+        let total_amount_wad = (total_amount as u128)
             .checked_mul(WAD)
             .ok_or(StakingError::MathOverflow)?;
-        let new_stake_debt = wad_mul(
-            (amount as u128).checked_mul(WAD).ok_or(StakingError::MathOverflow)?,
-            pool.acc_reward_per_weighted_share,
-        )?;
-        user_stake.reward_debt = old_reward_debt
-            .checked_add(claim_paid_wad)
-            .ok_or(StakingError::MathOverflow)?
-            .checked_add(new_stake_debt)
-            .ok_or(StakingError::MathOverflow)?;
+        user_stake.reward_debt = wad_mul(total_amount_wad, pool.acc_reward_per_weighted_share)?;
 
         // Update pool-level aggregate: subtract old, add new (saturating for bootstrapping)
         pool.total_reward_debt = pool
@@ -324,6 +318,11 @@ pub fn process_stake(
             .saturating_sub(old_reward_debt)
             .checked_add(user_stake.reward_debt)
             .ok_or(StakingError::MathOverflow)?;
+
+        // Increment cumulative rewards counter for auto-claim
+        if auto_claim_transfer > 0 {
+            user_stake.total_rewards_claimed = user_stake.total_rewards_claimed.saturating_add(auto_claim_transfer);
+        }
 
         let mut stake_data = user_stake_info.try_borrow_mut_data()?;
         user_stake.serialize(&mut &mut stake_data[..])?;
@@ -370,6 +369,7 @@ pub fn process_stake(
         **pool_info.try_borrow_mut_lamports()? -= auto_claim_transfer;
         **user_info.try_borrow_mut_lamports()? += auto_claim_transfer;
         msg!("Auto-claimed {} lamports in pending rewards", auto_claim_transfer);
+        emit_reward_payout(pool_info.key, user_info.key, auto_claim_transfer, RewardPayoutType::AutoClaimStake);
     }
 
     // Optional metadata account: increment member_count on new stake

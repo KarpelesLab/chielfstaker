@@ -14,6 +14,7 @@ use spl_token_2022::extension::StateWithExtensions;
 
 use crate::{
     error::StakingError,
+    events::{emit_reward_payout, RewardPayoutType},
     math::{calculate_user_weighted_stake, wad_div, wad_mul, U256, WAD},
     state::{StakingPool, UserStake, POOL_SEED},
 };
@@ -117,26 +118,13 @@ pub fn execute_unstake<'a>(
 
     // Recalculate reward debt for remaining stake
     if user_stake.amount > 0 {
-        // Advance old reward_debt by paid amount, then scale down to remaining proportion.
-        // This preserves the encoded snapshot while accounting for claimed rewards.
-        // Unpaid rewards remain naturally visible via the snapshot delta (no explicit subtraction).
-        let reward_paid_wad = (reward_transfer_amount as u128)
-            .checked_mul(WAD)
-            .ok_or(StakingError::MathOverflow)?;
-        let advanced_rd = old_reward_debt
-            .checked_add(reward_paid_wad)
-            .ok_or(StakingError::MathOverflow)?;
-        let original_amount = (user_stake.amount as u128)
-            .checked_add(amount as u128)
-            .ok_or(StakingError::MathOverflow)?;
-        let original_amount_wad = original_amount
-            .checked_mul(WAD)
-            .ok_or(StakingError::MathOverflow)?;
-        let new_snapshot = wad_div(advanced_rd, original_amount_wad)?;
+        // Reset snapshot to current acc_rps for the remaining position.
+        // Same rationale as claim: prevents repeated-unstake exploit from extracting
+        // max-weight rewards via geometric series.
         let remaining_amount_wad = (user_stake.amount as u128)
             .checked_mul(WAD)
             .ok_or(StakingError::MathOverflow)?;
-        user_stake.reward_debt = wad_mul(remaining_amount_wad, new_snapshot)?;
+        user_stake.reward_debt = wad_mul(remaining_amount_wad, pool.acc_reward_per_weighted_share)?;
 
         // Update pool-level aggregate: subtract old, add new (saturating for bootstrapping)
         pool.total_reward_debt = pool
@@ -164,6 +152,14 @@ pub fn execute_unstake<'a>(
             .checked_add(residual_lamports)
             .ok_or(StakingError::MathOverflow)?;
     }
+
+    // Increment cumulative rewards counter
+    if reward_transfer_amount > 0 {
+        user_stake.total_rewards_claimed = user_stake.total_rewards_claimed.saturating_add(reward_transfer_amount);
+    }
+
+    // Realloc legacy accounts to current size (payer = user)
+    UserStake::maybe_realloc(user_stake_info, user_info)?;
 
     // Save states (before CPI — pool data includes pre-updated last_synced_lamports)
     {
@@ -209,6 +205,7 @@ pub fn execute_unstake<'a>(
         **pool_info.try_borrow_mut_lamports()? -= reward_transfer_amount;
         **user_info.try_borrow_mut_lamports()? += reward_transfer_amount;
         msg!("Claimed {} lamports in rewards", reward_transfer_amount);
+        emit_reward_payout(pool_info.key, user_info.key, reward_transfer_amount, RewardPayoutType::Unstake);
     }
 
     msg!("Unstaked {} tokens", amount);
