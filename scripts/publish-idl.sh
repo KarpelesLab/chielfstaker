@@ -18,7 +18,14 @@ PROGRAM_ID="3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr"
 IDL_FILE="$(cd "$(dirname "$0")/.." && pwd)/idl.json"
 RPC_URL="https://api.mainnet-beta.solana.com"
 KEYPAIR="$HOME/.config/solana/id.json"
-SOLANA_CLI="/pkg/main/net-p2p.agave.core/bin/solana"
+AGAVE_LOCAL="$HOME/.local/share/solana/install/active_release/bin"
+if [ -x "/pkg/main/net-p2p.agave.core/bin/solana" ]; then
+    SOLANA_CLI="/pkg/main/net-p2p.agave.core/bin/solana"
+elif [ -x "$AGAVE_LOCAL/solana" ]; then
+    SOLANA_CLI="$AGAVE_LOCAL/solana"
+else
+    SOLANA_CLI="solana"
+fi
 PRIORITY_FEES=1000000
 
 # Parse arguments

@@ -12,8 +12,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-SOLANA_CLI="/pkg/main/net-p2p.agave.core/bin/solana"
-VALIDATOR_BIN="/pkg/main/net-p2p.agave.core/bin/solana-test-validator"
+AGAVE_LOCAL="$HOME/.local/share/solana/install/active_release/bin"
+if [ -x "/pkg/main/net-p2p.agave.core/bin/solana" ]; then
+    SOLANA_BIN="/pkg/main/net-p2p.agave.core/bin"
+elif [ -x "$AGAVE_LOCAL/solana" ]; then
+    SOLANA_BIN="$AGAVE_LOCAL"
+else
+    SOLANA_BIN=""
+fi
+SOLANA_CLI="${SOLANA_BIN:+$SOLANA_BIN/}solana"
+VALIDATOR_BIN="${SOLANA_BIN:+$SOLANA_BIN/}solana-test-validator"
 
 cd "$PROJECT_DIR"
 

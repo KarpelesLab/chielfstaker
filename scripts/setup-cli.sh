@@ -5,7 +5,15 @@
 
 set -e
 
-SOLANA_CLI="/pkg/main/net-p2p.agave.core/bin/solana"
+AGAVE_LOCAL="$HOME/.local/share/solana/install/active_release/bin"
+if [ -x "/pkg/main/net-p2p.agave.core/bin/solana" ]; then
+    SOLANA_BIN="/pkg/main/net-p2p.agave.core/bin"
+elif [ -x "$AGAVE_LOCAL/solana" ]; then
+    SOLANA_BIN="$AGAVE_LOCAL"
+else
+    SOLANA_BIN=""
+fi
+SOLANA_CLI="${SOLANA_BIN:+$SOLANA_BIN/}solana"
 
 echo "=== Configuring Solana CLI ==="
 
@@ -16,7 +24,7 @@ $SOLANA_CLI config set --url http://127.0.0.1:8899
 KEYPAIR_PATH="${HOME}/.config/solana/id.json"
 if [ ! -f "$KEYPAIR_PATH" ]; then
     echo "Generating new keypair..."
-    /pkg/main/net-p2p.agave.core/bin/solana-keygen new --no-bip39-passphrase -o "$KEYPAIR_PATH"
+    ${SOLANA_BIN:+$SOLANA_BIN/}solana-keygen new --no-bip39-passphrase -o "$KEYPAIR_PATH"
 fi
 
 # Show config

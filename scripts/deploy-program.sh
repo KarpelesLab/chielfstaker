@@ -5,7 +5,14 @@
 
 set -e
 
-SOLANA_CLI="/pkg/main/net-p2p.agave.core/bin/solana"
+AGAVE_LOCAL="$HOME/.local/share/solana/install/active_release/bin"
+if [ -x "/pkg/main/net-p2p.agave.core/bin/solana" ]; then
+    SOLANA_CLI="/pkg/main/net-p2p.agave.core/bin/solana"
+elif [ -x "$AGAVE_LOCAL/solana" ]; then
+    SOLANA_CLI="$AGAVE_LOCAL/solana"
+else
+    SOLANA_CLI="solana"
+fi
 
 if [ -z "$1" ]; then
     echo "Usage: $0 <program.so>"
