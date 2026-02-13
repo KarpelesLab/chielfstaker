@@ -11,6 +11,8 @@ crate-type = ["cdylib", "lib"]
 [features]
 no-entrypoint = []
 test-sbf = []
+custom-heap = []
+custom-panic = []
 
 [dependencies]
 solana-program = "2.0"
