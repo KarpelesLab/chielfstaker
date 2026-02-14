@@ -102,6 +102,9 @@ pub enum StakingError {
 
     #[error("Token mint has a dangerous extension (PermanentDelegate, TransferHook, etc.)")]
     UnsupportedMintExtension,
+
+    #[error("System program required for legacy account reallocation")]
+    MissingSystemProgram,
 }
 
 impl From<StakingError> for ProgramError {

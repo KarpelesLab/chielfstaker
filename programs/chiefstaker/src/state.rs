@@ -386,11 +386,12 @@ impl BorshDeserialize for UserStake {
 
 impl UserStake {
     /// Realloc account to current LEN if it's a legacy (smaller) account.
-    /// Transfers additional rent from payer to the account via direct lamport manipulation.
+    /// Transfers additional rent from payer to the account via system program CPI.
     /// No-op if account is already at or above current LEN.
     pub fn maybe_realloc<'a>(
         account: &AccountInfo<'a>,
         payer: &AccountInfo<'a>,
+        system_program: Option<&AccountInfo<'a>>,
     ) -> Result<(), solana_program::program_error::ProgramError> {
         if account.data_len() >= Self::LEN {
             return Ok(());
@@ -402,8 +403,16 @@ impl UserStake {
         let rent_delta = new_rent.saturating_sub(old_rent);
 
         if rent_delta > 0 {
-            **payer.try_borrow_mut_lamports()? -= rent_delta;
-            **account.try_borrow_mut_lamports()? += rent_delta;
+            let sys_prog = system_program
+                .ok_or(StakingError::MissingSystemProgram)?;
+            solana_program::program::invoke(
+                &solana_program::system_instruction::transfer(
+                    payer.key,
+                    account.key,
+                    rent_delta,
+                ),
+                &[payer.clone(), account.clone(), sys_prog.clone()],
+            )?;
         }
 
         account.realloc(Self::LEN, false)?;

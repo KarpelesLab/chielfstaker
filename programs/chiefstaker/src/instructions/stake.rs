@@ -194,7 +194,7 @@ pub fn process_stake(
         pool.set_sum_stake_exp(new_sum);
     } else {
         // Realloc legacy accounts to current size (payer = user)
-        UserStake::maybe_realloc(user_stake_info, user_info)?;
+        UserStake::maybe_realloc(user_stake_info, user_info, Some(system_program_info))?;
 
         // Load existing stake
         if user_stake_info.owner != program_id {

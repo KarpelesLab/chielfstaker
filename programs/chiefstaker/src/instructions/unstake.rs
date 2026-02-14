@@ -36,6 +36,7 @@ pub fn execute_unstake<'a>(
     user_info: &AccountInfo<'a>,
     amount: u64,
     current_time: i64,
+    system_program_info: Option<&AccountInfo<'a>>,
 ) -> ProgramResult {
 
     // Capture old reward_debt for total_reward_debt bookkeeping
@@ -162,7 +163,7 @@ pub fn execute_unstake<'a>(
     }
 
     // Realloc legacy accounts to current size (payer = user)
-    UserStake::maybe_realloc(user_stake_info, user_info)?;
+    UserStake::maybe_realloc(user_stake_info, user_info, system_program_info)?;
 
     // Save states (before CPI — pool data includes pre-updated last_synced_lamports)
     {
@@ -339,6 +340,9 @@ pub fn process_unstake(
         }
     }
 
+    // Optional trailing system program for legacy account reallocation
+    let system_program_info = account_info_iter.next();
+
     // Execute the shared unstake logic
     execute_unstake(
         program_id,
@@ -352,5 +356,6 @@ pub fn process_unstake(
         user_info,
         amount,
         current_time,
+        system_program_info,
     )
 }

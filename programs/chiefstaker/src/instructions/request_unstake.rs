@@ -67,7 +67,9 @@ pub fn process_request_unstake(
     }
 
     // Realloc legacy accounts to current size (payer = user)
-    UserStake::maybe_realloc(user_stake_info, user_info)?;
+    // System program is optional trailing account, only needed for legacy accounts
+    let system_program_info = account_info_iter.next();
+    UserStake::maybe_realloc(user_stake_info, user_info, system_program_info)?;
 
     // Load and validate user stake
     if user_stake_info.owner != program_id {

@@ -127,6 +127,9 @@ pub fn process_complete_unstake(
     user_stake.unstake_request_amount = 0;
     user_stake.unstake_request_time = 0;
 
+    // Optional trailing system program for legacy account reallocation
+    let system_program_info = account_info_iter.next();
+
     // Execute the shared unstake logic
     execute_unstake(
         program_id,
@@ -140,5 +143,6 @@ pub fn process_complete_unstake(
         user_info,
         amount,
         current_time,
+        system_program_info,
     )
 }
