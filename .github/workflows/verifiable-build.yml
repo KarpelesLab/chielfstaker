@@ -22,10 +22,15 @@ jobs:
       - name: Generate keypair
         run: solana-keygen new --no-bip39-passphrase
 
+      - name: Install platform-tools
+        run: |
+          # Build a dummy project to trigger platform-tools download
+          # (platform-tools provides the SBF target compiler)
+          cargo init /tmp/sbf-dummy --edition 2021
+          cd /tmp/sbf-dummy && cargo build-sbf && rm -rf /tmp/sbf-dummy
+
       - name: Build program
         run: |
-          # Install platform-tools (SBF target compiler)
-          cargo build-sbf --force-tools-install
           # Prepend system rustc so it takes precedence over platform-tools rustc
           # (platform-tools ships rustc 1.75 which is too old for current deps)
           SYSTEM_RUSTC_DIR="$(dirname "$(rustup which rustc)")"
