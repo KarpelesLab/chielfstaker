@@ -1,0 +1,37 @@
+name: Verifiable Build
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'programs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - 'programs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+jobs:
+  verifiable-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install solana-verify
+        run: cargo install solana-verify --version 0.4.11
+
+      - name: Build verifiable binary
+        run: solana-verify build --library-name chiefstaker
+
+      - name: Print executable hash
+        run: solana-verify get-executable-hash target/deploy/chiefstaker.so
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiefstaker-verifiable
+          path: target/deploy/chiefstaker.so
+          retention-days: 90
