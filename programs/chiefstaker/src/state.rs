@@ -79,7 +79,7 @@ pub struct StakingPool {
 
     /// Sum of all active users' reward_debt values.
     /// Maintained incrementally by stake/unstake/claim instructions.
-    /// Used by RecoverStrandedRewards to compute stranded rewards from pool state alone.
+    /// Used by FixTotalRewardDebt to compute stranded rewards from pool state alone.
     /// Starts at 0 for existing pools (bootstraps conservatively — under-recovery is safe).
     pub total_reward_debt: u128,
 
@@ -87,7 +87,7 @@ pub struct StakingPool {
     /// but couldn't be fully paid because the pool lacked SOL).
     /// Tracked separately from `total_reward_debt` because residual users have
     /// amount=0 (no allocation in `total_staked * acc_rps`), so including their
-    /// debt in `total_reward_debt` would break the RecoverStrandedRewards formula.
+    /// debt in `total_reward_debt` would break the FixTotalRewardDebt formula.
     /// Starts at 0 for existing pools (binary-compatible with old `_reserved3`).
     pub total_residual_unpaid: u64,
 }

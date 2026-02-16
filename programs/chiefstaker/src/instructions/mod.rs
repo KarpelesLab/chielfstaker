@@ -13,7 +13,7 @@ pub mod request_unstake;
 pub mod complete_unstake;
 pub mod cancel_unstake;
 pub mod close_stake;
-pub mod recover_stranded;
+pub mod fix_total_reward_debt;
 pub mod set_metadata;
 
 pub use initialize::*;
@@ -29,5 +29,5 @@ pub use request_unstake::*;
 pub use complete_unstake::*;
 pub use cancel_unstake::*;
 pub use close_stake::*;
-pub use recover_stranded::*;
+pub use fix_total_reward_debt::*;
 pub use set_metadata::*;

@@ -145,7 +145,7 @@ pub fn execute_unstake<'a>(
         // Remove old debt from total_reward_debt but do NOT add the residual.
         // Residual debts are tracked separately in total_residual_unpaid because
         // the user's amount is 0 (no allocation in total_staked * acc_rps), and
-        // including them in total_reward_debt would break RecoverStrandedRewards.
+        // including them in total_reward_debt would break FixTotalRewardDebt.
         pool.total_reward_debt = pool
             .total_reward_debt
             .saturating_sub(old_reward_debt);

@@ -166,14 +166,18 @@ pub enum StakingInstruction {
     /// 2. `[writable, signer]` User/owner
     CloseStakeAccount,
 
-    /// Recover stranded rewards stuck in the pool (permissionless)
+    /// Fix total_reward_debt and recover stranded rewards (authority only)
     ///
-    /// Computes stranded amount on-chain using pool-level `total_reward_debt`
-    /// tracking. No additional accounts needed beyond the pool itself.
+    /// Accepts the correct `total_reward_debt` computed off-chain, sets it,
+    /// and recovers stranded SOL in one shot. Required because existing pools
+    /// bootstrapped total_reward_debt at 0 and only track incremental changes.
     ///
     /// Accounts:
     /// 0. `[writable]` Pool account
-    RecoverStrandedRewards,
+    /// 1. `[signer]` Authority
+    FixTotalRewardDebt {
+        new_total_reward_debt: u128,
+    },
 
     /// Set (create or update) pool metadata for explorer display (permissionless)
     ///
@@ -271,9 +275,9 @@ pub fn process_instruction(
             msg!("Instruction: CloseStakeAccount");
             process_close_stake_account(program_id, accounts)
         }
-        StakingInstruction::RecoverStrandedRewards => {
-            msg!("Instruction: RecoverStrandedRewards");
-            process_recover_stranded_rewards(program_id, accounts)
+        StakingInstruction::FixTotalRewardDebt { new_total_reward_debt } => {
+            msg!("Instruction: FixTotalRewardDebt");
+            process_fix_total_reward_debt(program_id, accounts, new_total_reward_debt)
         }
         StakingInstruction::SetPoolMetadata => {
             msg!("Instruction: SetPoolMetadata");

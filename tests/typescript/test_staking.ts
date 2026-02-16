@@ -62,7 +62,7 @@ enum InstructionType {
   CompleteUnstake = 10,
   CancelUnstakeRequest = 11,
   CloseStakeAccount = 12,
-  RecoverStrandedRewards = 13,
+  FixTotalRewardDebt = 13,
   SetPoolMetadata = 14,
 }
 
@@ -374,15 +374,21 @@ function createCancelUnstakeRequestInstruction(
   });
 }
 
-function createRecoverStrandedRewardsInstruction(
+function createFixTotalRewardDebtInstruction(
   pool: PublicKey,
+  authority: PublicKey,
+  newDebt: bigint,
 ): TransactionInstruction {
-  const data = Buffer.alloc(1);
-  data.writeUInt8(InstructionType.RecoverStrandedRewards, 0);
+  const data = Buffer.alloc(1 + 16);
+  data.writeUInt8(InstructionType.FixTotalRewardDebt, 0);
+  // Write u128 LE (16 bytes)
+  data.writeBigUInt64LE(newDebt & BigInt('0xFFFFFFFFFFFFFFFF'), 1);
+  data.writeBigUInt64LE((newDebt >> BigInt(64)) & BigInt('0xFFFFFFFFFFFFFFFF'), 9);
 
   return new TransactionInstruction({
     keys: [
       { pubkey: pool, isSigner: false, isWritable: true },
+      { pubkey: authority, isSigner: true, isWritable: false },
     ],
     programId: PROGRAM_ID,
     data,
@@ -734,8 +740,8 @@ class TestContext {
     return await sendAndConfirmTransaction(this.connection, tx, [this.payer, user]);
   }
 
-  async recoverStrandedRewards(): Promise<string> {
-    const ix = createRecoverStrandedRewardsInstruction(this.poolPDA);
+  async fixTotalRewardDebt(newDebt: bigint): Promise<string> {
+    const ix = createFixTotalRewardDebtInstruction(this.poolPDA, this.payer.publicKey, newDebt);
     const tx = new Transaction().add(ix);
     return await sendAndConfirmTransaction(this.connection, tx, [this.payer]);
   }
@@ -2979,7 +2985,7 @@ async function runTests() {
   // SOL CONSERVATION & RECOVERY TESTS
   // ============================================
   // Verify no SOL is lost (dead/stranded) from additional stakes,
-  // and that RecoverStrandedRewards works correctly.
+  // and that FixTotalRewardDebt works correctly.
 
   console.log('\n--- SOL Conservation & Recovery Tests ---\n');
 
@@ -3082,7 +3088,7 @@ async function runTests() {
     // Extra check: pool remaining should not exceed deposits.
     // At tau=60 with short waits (~15% weight), most rewards remain in pool as
     // stranded/unclaimed — this is expected behavior, not a bug. The stranded rewards
-    // would be redistributed via RecoverStrandedRewards. We just verify the pool
+    // would be redistributed via FixTotalRewardDebt. We just verify the pool
     // isn't holding MORE than deposited (which would indicate SOL creation).
     if (poolRewardsRemaining > totalDeposited + BigInt(100_000)) {
       throw new Error(`Pool has more than deposited: ${poolRewardsRemaining} > ${totalDeposited}`);
@@ -3090,7 +3096,7 @@ async function runTests() {
     console.log('    Conservation: OK');
   });
 
-  // Test: RecoverStrandedRewards doesn't steal from claimable rewards
+  // Test: FixTotalRewardDebt doesn't steal from claimable rewards
   await test('Recovery: does not steal claimable rewards', async () => {
     const ctx = new TestContext(connection, Keypair.generate());
     await ctx.setup();
@@ -3116,8 +3122,8 @@ async function runTests() {
     const stateBefore = await ctx.readPoolState();
     console.log(`    Before recovery: lastSynced=${stateBefore.lastSyncedLamports}, totalRewardDebt=${stateBefore.totalRewardDebt}`);
 
-    // Call RecoverStrandedRewards
-    await ctx.recoverStrandedRewards();
+    // Call FixTotalRewardDebt (pass current debt — correct for fresh pools)
+    await ctx.fixTotalRewardDebt(stateBefore.totalRewardDebt);
 
     const stateAfter = await ctx.readPoolState();
     const recovered = stateBefore.lastSyncedLamports - stateAfter.lastSyncedLamports;
@@ -3161,7 +3167,7 @@ async function runTests() {
     }
   });
 
-  // Test: RecoverStrandedRewards is idempotent (second call recovers nothing extra)
+  // Test: FixTotalRewardDebt is idempotent (second call recovers nothing extra)
   await test('Recovery: idempotent (second call recovers nothing)', async () => {
     const ctx = new TestContext(connection, Keypair.generate());
     await ctx.setup();
@@ -3181,11 +3187,12 @@ async function runTests() {
     await new Promise(r => setTimeout(r, 10000));
 
     // First recovery
-    await ctx.recoverStrandedRewards();
+    const stateBeforeRecovery = await ctx.readPoolState();
+    await ctx.fixTotalRewardDebt(stateBeforeRecovery.totalRewardDebt);
     const stateAfter1 = await ctx.readPoolState();
 
-    // Second recovery — should be no-op
-    await ctx.recoverStrandedRewards();
+    // Second recovery — should be no-op (debt already correct)
+    await ctx.fixTotalRewardDebt(stateAfter1.totalRewardDebt);
     const stateAfter2 = await ctx.readPoolState();
 
     console.log(`    After 1st recovery: lastSynced=${stateAfter1.lastSyncedLamports}`);
@@ -3324,7 +3331,8 @@ async function runTests() {
     await new Promise(r => setTimeout(r, 6000));
 
     // Recovery — pick up any rounding dust
-    await ctx.recoverStrandedRewards();
+    const stateBeforeRecovery = await ctx.readPoolState();
+    await ctx.fixTotalRewardDebt(stateBeforeRecovery.totalRewardDebt);
     await ctx.syncRewards();
 
     // Phase 3: everyone claims and unstakes
@@ -3381,7 +3389,7 @@ async function runTests() {
     console.log(`    Conservation OK (diff=${diff} lamports)`);
   });
 
-  // Test: RecoverStrandedRewards bounded — pool lamports never go below rent exempt
+  // Test: FixTotalRewardDebt bounded — pool lamports never go below rent exempt
   await test('Recovery: pool balance stays above rent exempt', async () => {
     const ctx = new TestContext(connection, Keypair.generate());
     await ctx.setup();
@@ -3406,7 +3414,8 @@ async function runTests() {
 
     // Now call recovery — pool has near-zero rewards left
     // This should NOT make pool insolvent
-    await ctx.recoverStrandedRewards();
+    const stateBeforeRecovery = await ctx.readPoolState();
+    await ctx.fixTotalRewardDebt(stateBeforeRecovery.totalRewardDebt);
 
     const poolBalance = BigInt(await ctx.getBalance(ctx.poolPDA));
     const poolAccountInfo = await connection.getAccountInfo(ctx.poolPDA);
