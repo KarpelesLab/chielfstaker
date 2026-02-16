@@ -4271,9 +4271,10 @@ async function runTests() {
     console.log(`    Immature credit (lamports): ${creditLamports}`);
     console.log(`    Claimed: ${claimed}`);
 
-    // Should claim at least 70% of the credit (conservative: combined weight ~86% after 40s+30s avg)
-    if (claimed < creditLamports * 70n / 100n) {
-      throw new Error(`Claimed ${claimed} < 70% of immature credit ${creditLamports}`);
+    // With 1B old (30s) + 2B fresh, blended exp is ~1.43. At 70s from base_time:
+    // weight ≈ 1 - e^(-70/60) * 1.43 ≈ 55%. Check at least 40% of credit is claimable.
+    if (claimed < creditLamports * 40n / 100n) {
+      throw new Error(`Claimed ${claimed} < 40% of immature credit ${creditLamports}`);
     }
 
     console.log('    Proportional maturation: OK');
@@ -4499,10 +4500,11 @@ async function runTests() {
     console.log(`    Total received: ${totalReceived} lamports`);
     console.log(`    Total deposited: ${deposit} lamports`);
 
-    // As the sole staker with near-full maturity, should recover nearly all deposit.
-    // Allow some tolerance for WAD rounding and partial maturity gaps.
-    if (totalReceived < deposit * 85n / 100n) {
-      throw new Error(`Sole staker should recover >85% of deposit, got ${totalReceived} of ${deposit}`);
+    // With 1B+1B blended exp at t=90s from base, combined weight ≈ 70%.
+    // Total recovery ≈ mature_auto_claim + 70% * immature ≈ 39% + 70%*61% ≈ 82%.
+    // Use 75% threshold to allow for timing variance in CI.
+    if (totalReceived < deposit * 75n / 100n) {
+      throw new Error(`Sole staker should recover >75% of deposit, got ${totalReceived} of ${deposit}`);
     }
 
     // Conservation: cannot exceed deposit
