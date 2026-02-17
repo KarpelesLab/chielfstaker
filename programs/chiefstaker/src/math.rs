@@ -430,4 +430,239 @@ mod tests {
         let restored = U256::from_le_bytes(&bytes);
         assert_eq!(val, restored);
     }
+
+    // --- Property / invariant tests (audit-recommended) ---
+
+    #[test]
+    fn test_weight_monotonicity() {
+        // Weight must never decrease as age increases
+        let tau = 86_400u64; // 1 day
+        let amount = 1_000_000u64;
+        let mut prev = 0u128;
+        for age in (0..=5 * tau as i64).step_by(3600) {
+            let w = calculate_weight(amount, age, tau).unwrap();
+            assert!(w >= prev, "weight decreased at age={}: {} < {}", age, w, prev);
+            prev = w;
+        }
+    }
+
+    #[test]
+    fn test_rebase_invariance() {
+        // calculate_total_weighted_stake must give the same answer before and
+        // after a simulated rebase (shifting base_time forward and scaling
+        // sum_stake_exp by exp(-delta/tau)).
+        let tau = 86_400u64;
+        let total_staked = 5_000u128;
+        let base_time = 1_000_000i64;
+        let current_time = base_time + 50_000;
+
+        // Build sum_stake_exp: 3 users staking at different times
+        let stakes: [(u64, i64); 3] = [
+            (1_000, base_time + 1_000),
+            (2_000, base_time + 10_000),
+            (2_000, base_time + 20_000),
+        ];
+        let mut sum_exp = U256::zero();
+        for (amt, start) in &stakes {
+            let ratio = exp_time_ratio(*start - base_time, tau).unwrap();
+            let contribution = U256::from_u128(*amt as u128)
+                .checked_mul(U256::from_u128(ratio))
+                .unwrap();
+            sum_exp = sum_exp + contribution;
+        }
+
+        let w_before = calculate_total_weighted_stake(
+            total_staked, &sum_exp, current_time, base_time, tau,
+        )
+        .unwrap();
+
+        // Simulate rebase: shift base_time by +30_000s
+        let delta = 30_000i64;
+        let new_base = base_time + delta;
+        let scale = exp_neg_time_ratio(delta, tau).unwrap();
+        let new_sum_exp = wad_mul_u256(sum_exp, U256::from_u128(scale)).unwrap();
+
+        let w_after = calculate_total_weighted_stake(
+            total_staked, &new_sum_exp, current_time, new_base, tau,
+        )
+        .unwrap();
+
+        // Allow 1 WAD of rounding error (< 1 lamport)
+        let diff = if w_before > w_after {
+            w_before - w_after
+        } else {
+            w_after - w_before
+        };
+        assert!(
+            diff <= WAD,
+            "rebase changed weighted stake: before={}, after={}, diff={}",
+            w_before, w_after, diff
+        );
+    }
+
+    #[test]
+    fn test_user_weighted_stake_bounded() {
+        // User weighted stake must always be <= amount * WAD
+        let tau = 86_400u64;
+        let base_time = 0i64;
+        for amount in [1u64, 100, 1_000_000, u32::MAX as u64] {
+            let exp_sf = WAD; // staked at base_time
+            for age in [0i64, 1, 3600, 86_400, 864_000, 8_640_000] {
+                let w = calculate_user_weighted_stake(
+                    amount, exp_sf, age, base_time, tau,
+                )
+                .unwrap();
+                let max = (amount as u128) * WAD;
+                assert!(
+                    w <= max,
+                    "weighted {} > max {} for amount={}, age={}",
+                    w, max, amount, age
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_claimed_rewards_frequency_independence() {
+        // Claiming N times must yield the same total as claiming once at the end.
+        // Setup: user stakes `amount` at time 0 (base_time=0, tau=86400).
+        // acc_rps increments through [1, 2, 3, 4, 5] * WAD at ages [1d, 2d, 3d, 4d, 5d].
+        let tau = 86_400u64;
+        let amount = 1_000u64;
+        let base_time = 0i64;
+        let exp_sf = WAD; // staked at base_time
+        let snapshot_rps = 0u128; // reward_debt encodes snapshot = 0
+
+        let steps: [(i64, u128); 5] = [
+            (86_400, 1 * WAD),
+            (2 * 86_400, 2 * WAD),
+            (3 * 86_400, 3 * WAD),
+            (4 * 86_400, 4 * WAD),
+            (5 * 86_400, 5 * WAD),
+        ];
+
+        // Multi-claim: claim at each step
+        let mut claimed_wad = 0u128;
+        let mut total_lamports_multi = 0u64;
+        for &(t, acc_rps) in &steps {
+            let w = calculate_user_weighted_stake(amount, exp_sf, t, base_time, tau).unwrap();
+            let delta_rps = acc_rps - snapshot_rps;
+            let full_ent = wad_mul(w, delta_rps).unwrap();
+            let pending = full_ent.saturating_sub(claimed_wad);
+            let lam = (pending / WAD) as u64;
+            total_lamports_multi += lam;
+            claimed_wad += pending;
+        }
+
+        // Single claim at the end
+        let &(t_final, acc_rps_final) = steps.last().unwrap();
+        let w_final =
+            calculate_user_weighted_stake(amount, exp_sf, t_final, base_time, tau).unwrap();
+        let full_ent_single = wad_mul(w_final, acc_rps_final - snapshot_rps).unwrap();
+        let total_lamports_single = (full_ent_single / WAD) as u64;
+
+        // The multi-claim total may differ by at most N-1 lamports due to
+        // per-step floor division (each `/WAD` can lose up to 1 lamport).
+        let diff = if total_lamports_multi > total_lamports_single {
+            total_lamports_multi - total_lamports_single
+        } else {
+            total_lamports_single - total_lamports_multi
+        };
+        assert!(
+            diff <= (steps.len() as u64),
+            "frequency dependence: multi={} vs single={}, diff={}",
+            total_lamports_multi, total_lamports_single, diff
+        );
+    }
+
+    #[test]
+    fn test_reward_conservation() {
+        // Total claimed rewards across all users must not exceed total deposited
+        // rewards, within rounding tolerance.
+        // Scenario: 2 users each stake 1000 tokens. Pool receives 10 SOL rewards.
+        let tau = 86_400u64;
+        let base_time = 0i64;
+        let total_staked = 2_000u128;
+        let reward_deposit = 10_000_000_000u64; // 10 SOL in lamports
+
+        // Both users stake at base_time
+        let amount = 1_000u64;
+        let exp_sf = WAD;
+
+        // After full maturity (age >> tau), each user has weight = amount * WAD
+        let age = 100 * tau as i64;
+
+        // acc_rps = reward_deposit * WAD / total_weighted
+        // total_weighted = total_staked * WAD (fully mature)
+        let total_weighted = total_staked * WAD;
+        let acc_rps = wad_div(
+            (reward_deposit as u128) * WAD,
+            total_weighted,
+        )
+        .unwrap();
+
+        // Each user's claim
+        let w = calculate_user_weighted_stake(amount, exp_sf, age, base_time, tau).unwrap();
+        let full_ent = wad_mul(w, acc_rps).unwrap();
+        let per_user_lamports = (full_ent / WAD) as u64;
+        let total_claimed = per_user_lamports * 2;
+
+        // Conservation: total claimed <= deposited, within 2 lamport rounding
+        assert!(
+            total_claimed <= reward_deposit + 2,
+            "over-payment: claimed {} > deposited {}",
+            total_claimed, reward_deposit
+        );
+        assert!(
+            total_claimed + 2 >= reward_deposit,
+            "under-payment: claimed {} << deposited {}",
+            total_claimed, reward_deposit
+        );
+    }
+
+    #[test]
+    fn test_exp_start_factor_weighted_average() {
+        // When a user adds more stake, the new exp_start_factor must be a
+        // weighted average that preserves each deposit's contribution.
+        let tau = 86_400u64;
+        let base_time = 0i64;
+
+        // First deposit: 1000 tokens at time 10_000
+        let amt1 = 1_000u64;
+        let t1 = 10_000i64;
+        let esf1 = exp_time_ratio(t1 - base_time, tau).unwrap();
+
+        // Second deposit: 500 tokens at time 50_000
+        let amt2 = 500u64;
+        let t2 = 50_000i64;
+        let esf2 = exp_time_ratio(t2 - base_time, tau).unwrap();
+
+        // Combined weighted average: (amt1 * esf1 + amt2 * esf2) / (amt1 + amt2)
+        let total_amt = amt1 + amt2;
+        let numerator = (amt1 as u128) * esf1 + (amt2 as u128) * esf2;
+        let combined_esf = numerator / (total_amt as u128);
+
+        // Check: user_weighted_stake with combined must equal sum of individual
+        // weighted stakes (within rounding)
+        let eval_time = 100_000i64;
+        let w_combined = calculate_user_weighted_stake(
+            total_amt, combined_esf, eval_time, base_time, tau,
+        )
+        .unwrap();
+        let w1 = calculate_user_weighted_stake(amt1, esf1, eval_time, base_time, tau).unwrap();
+        let w2 = calculate_user_weighted_stake(amt2, esf2, eval_time, base_time, tau).unwrap();
+        let w_sum = w1 + w2;
+
+        let diff = if w_combined > w_sum {
+            w_combined - w_sum
+        } else {
+            w_sum - w_combined
+        };
+        // Allow up to 1 WAD rounding per deposit
+        assert!(
+            diff <= 2 * WAD,
+            "weighted average broke: combined={}, sum={}, diff={}",
+            w_combined, w_sum, diff
+        );
+    }
 }

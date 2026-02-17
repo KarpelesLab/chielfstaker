@@ -105,6 +105,9 @@ pub enum StakingError {
 
     #[error("System program required for legacy account reallocation")]
     MissingSystemProgram,
+
+    #[error("New total_reward_debt exceeds maximum accumulated rewards")]
+    RewardDebtExceedsBound,
 }
 
 impl From<StakingError> for ProgramError {
