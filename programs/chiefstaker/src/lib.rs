@@ -219,10 +219,38 @@ pub enum StakingInstruction {
     /// 16. `[writable]` coin creator vault authority
     /// 17. `[writable]` coin creator vault ATA
     TakeFeeOwnership,
+
+    /// Stake tokens on behalf of another user (beneficiary)
+    ///
+    /// Accounts:
+    /// 0. `[writable]` Pool account
+    /// 1. `[writable]` Beneficiary stake account (PDA: ["stake", pool, beneficiary])
+    /// 2. `[writable]` Token vault
+    /// 3. `[writable]` Staker's token account
+    /// 4. `[]` Token mint
+    /// 5. `[writable, signer]` Staker (payer + token source)
+    /// 6. `[writable]` Beneficiary (receives position + auto-claimed rewards)
+    /// 7. `[]` System program
+    /// 8. `[]` Token 2022 program
+    StakeOnBehalf {
+        amount: u64,
+    },
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
 entrypoint!(process_instruction);
+
+#[cfg(not(feature = "no-entrypoint"))]
+use solana_security_txt::security_txt;
+
+#[cfg(not(feature = "no-entrypoint"))]
+security_txt! {
+    name: "ChiefStaker",
+    project_url: "https://github.com/KarpelesLab/chiefstaker",
+    contacts: "link:https://github.com/KarpelesLab/chiefstaker/security/advisories",
+    policy: "https://github.com/KarpelesLab/chiefstaker/security/policy",
+    source_code: "https://github.com/KarpelesLab/chiefstaker"
+}
 
 /// Program entrypoint
 pub fn process_instruction(
@@ -314,6 +342,10 @@ pub fn process_instruction(
         StakingInstruction::TakeFeeOwnership => {
             msg!("Instruction: TakeFeeOwnership");
             process_take_fee_ownership(program_id, accounts)
+        }
+        StakingInstruction::StakeOnBehalf { amount } => {
+            msg!("Instruction: StakeOnBehalf (amount={})", amount);
+            process_stake_on_behalf(program_id, accounts, amount)
         }
     }
 }

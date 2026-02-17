@@ -16,6 +16,7 @@ pub mod close_stake;
 pub mod fix_total_reward_debt;
 pub mod set_metadata;
 pub mod take_fee_ownership;
+pub mod stake_on_behalf;
 
 pub use initialize::*;
 pub use stake::*;
@@ -33,3 +34,4 @@ pub use close_stake::*;
 pub use fix_total_reward_debt::*;
 pub use set_metadata::*;
 pub use take_fee_ownership::*;
+pub use stake_on_behalf::*;

@@ -22,6 +22,7 @@ borsh = "1.5"
 uint = "0.10"
 bytemuck = { version = "1.14", features = ["derive"] }
 thiserror = "1.0"
+solana-security-txt = "1.1"
 
 [dev-dependencies]
 solana-program-test = "2.0"

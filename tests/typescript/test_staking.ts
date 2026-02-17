@@ -65,6 +65,7 @@ enum InstructionType {
   FixTotalRewardDebt = 13,
   SetPoolMetadata = 14,
   TakeFeeOwnership = 15,
+  StakeOnBehalf = 16,
 }
 
 // Helper to derive PDAs
@@ -451,6 +452,43 @@ function createCloseStakeAccountInstruction(
   });
 }
 
+function createStakeOnBehalfInstruction(
+  pool: PublicKey,
+  beneficiaryStake: PublicKey,
+  tokenVault: PublicKey,
+  stakerToken: PublicKey,
+  mint: PublicKey,
+  staker: PublicKey,
+  beneficiary: PublicKey,
+  amount: bigint,
+  metadataPDA?: PublicKey,
+): TransactionInstruction {
+  const data = Buffer.alloc(1 + 8);
+  data.writeUInt8(InstructionType.StakeOnBehalf, 0);
+  data.writeBigUInt64LE(amount, 1);
+
+  const keys = [
+    { pubkey: pool, isSigner: false, isWritable: true },
+    { pubkey: beneficiaryStake, isSigner: false, isWritable: true },
+    { pubkey: tokenVault, isSigner: false, isWritable: true },
+    { pubkey: stakerToken, isSigner: false, isWritable: true },
+    { pubkey: mint, isSigner: false, isWritable: false },
+    { pubkey: staker, isSigner: true, isWritable: true },
+    { pubkey: beneficiary, isSigner: false, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
+  if (metadataPDA) {
+    keys.push({ pubkey: metadataPDA, isSigner: false, isWritable: true });
+  }
+
+  return new TransactionInstruction({
+    keys,
+    programId: PROGRAM_ID,
+    data,
+  });
+}
+
 function createStakeWithMetadataInstruction(
   pool: PublicKey,
   userStake: PublicKey,
@@ -611,6 +649,24 @@ class TestContext {
 
     const tx = new Transaction().add(ix);
     return await sendAndConfirmTransaction(this.connection, tx, [this.payer, user]);
+  }
+
+  async stakeOnBehalf(staker: Keypair, stakerToken: PublicKey, beneficiary: PublicKey, amount: bigint): Promise<string> {
+    const [beneficiaryStakePDA] = deriveUserStakePDA(this.poolPDA, beneficiary);
+
+    const ix = createStakeOnBehalfInstruction(
+      this.poolPDA,
+      beneficiaryStakePDA,
+      this.tokenVaultPDA,
+      stakerToken,
+      this.mint,
+      staker.publicKey,
+      beneficiary,
+      amount,
+    );
+
+    const tx = new Transaction().add(ix);
+    return await sendAndConfirmTransaction(this.connection, tx, [this.payer, staker]);
   }
 
   async unstake(user: Keypair, userToken: PublicKey, amount: bigint): Promise<string> {
@@ -4543,6 +4599,149 @@ async function runTests() {
     }
 
     console.log('    Full lifecycle with immature preservation: OK');
+  });
+
+  // ========== StakeOnBehalf Tests ==========
+
+  await test('StakeOnBehalf: stake on behalf of another user', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60)); // tau = 60s for fast maturity
+
+    // User A (staker) has tokens, User B (beneficiary) is just a pubkey
+    const userA = Keypair.generate();
+    const userB = Keypair.generate();
+    await airdropAndConfirm(connection, userA.publicKey, 2 * LAMPORTS_PER_SOL);
+    await airdropAndConfirm(connection, userB.publicKey, LAMPORTS_PER_SOL);
+
+    const userAToken = await ctx.createUserTokenAccount(userA.publicKey);
+    const stakeAmount = BigInt(1_000_000_000);
+    await ctx.mintTokens(userAToken, stakeAmount);
+
+    // A stakes on behalf of B
+    await ctx.stakeOnBehalf(userA, userAToken, userB.publicKey, stakeAmount);
+
+    // Verify B's stake PDA exists with correct amount and owner=B
+    const [beneficiaryStakePDA] = deriveUserStakePDA(ctx.poolPDA, userB.publicKey);
+    const stakeInfo = await connection.getAccountInfo(beneficiaryStakePDA);
+    if (!stakeInfo) throw new Error('Beneficiary stake account not created');
+    if (stakeInfo.data.length === 0) throw new Error('Beneficiary stake data empty');
+
+    // Read stake state: owner is at offset 8 (discriminator) = bytes 8..40
+    const ownerBytes = stakeInfo.data.slice(8, 40);
+    const ownerKey = new PublicKey(ownerBytes);
+    if (!ownerKey.equals(userB.publicKey)) {
+      throw new Error(`Stake owner should be B (${userB.publicKey}), got ${ownerKey}`);
+    }
+
+    // Read amount at offset 72 (u64 LE)
+    const stakedAmount = stakeInfo.data.readBigUInt64LE(72);
+    if (stakedAmount !== stakeAmount) {
+      throw new Error(`Staked amount should be ${stakeAmount}, got ${stakedAmount}`);
+    }
+
+    // Verify A's token account was debited
+    const aBalance = await ctx.getTokenBalance(userAToken);
+    if (aBalance !== 0n) {
+      throw new Error(`A should have 0 tokens, got ${aBalance}`);
+    }
+
+    console.log('    Stake on behalf created successfully, owner = B');
+  });
+
+  await test('StakeOnBehalf: beneficiary can claim rewards', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60)); // tau = 60s
+
+    const userA = Keypair.generate();
+    const userB = Keypair.generate();
+    await airdropAndConfirm(connection, userA.publicKey, 2 * LAMPORTS_PER_SOL);
+    await airdropAndConfirm(connection, userB.publicKey, LAMPORTS_PER_SOL);
+
+    const userAToken = await ctx.createUserTokenAccount(userA.publicKey);
+    const stakeAmount = BigInt(1_000_000_000);
+    await ctx.mintTokens(userAToken, stakeAmount);
+
+    // A stakes on behalf of B
+    await ctx.stakeOnBehalf(userA, userAToken, userB.publicKey, stakeAmount);
+
+    // Wait for some maturity
+    console.log('    Waiting 10s for maturity...');
+    await new Promise(r => setTimeout(r, 10000));
+
+    // Deposit rewards
+    const rewardAmount = BigInt(1_000_000_000); // 1 SOL
+    await ctx.depositRewards(rewardAmount);
+
+    // B claims rewards directly (normal ClaimRewards)
+    const bBalBefore = BigInt(await ctx.getBalance(userB.publicKey));
+    await ctx.claimRewards(userB);
+    const bBalAfter = BigInt(await ctx.getBalance(userB.publicKey));
+
+    const rewardReceived = bBalAfter - bBalBefore;
+    if (rewardReceived <= 0n) {
+      throw new Error(`B should have received rewards, got ${rewardReceived}`);
+    }
+    console.log(`    B received ${rewardReceived} lamports in rewards`);
+  });
+
+  await test('StakeOnBehalf: add-more auto-claims to beneficiary', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60)); // tau = 60s
+
+    const userA = Keypair.generate();
+    const userB = Keypair.generate();
+    await airdropAndConfirm(connection, userA.publicKey, 2 * LAMPORTS_PER_SOL);
+    await airdropAndConfirm(connection, userB.publicKey, LAMPORTS_PER_SOL);
+
+    const userAToken = await ctx.createUserTokenAccount(userA.publicKey);
+    const totalTokens = BigInt(2_000_000_000);
+    await ctx.mintTokens(userAToken, totalTokens);
+
+    // A stakes first batch on behalf of B
+    await ctx.stakeOnBehalf(userA, userAToken, userB.publicKey, BigInt(1_000_000_000));
+
+    // Wait for maturity and deposit rewards
+    console.log('    Waiting 10s for maturity...');
+    await new Promise(r => setTimeout(r, 10000));
+
+    const rewardAmount = BigInt(1_000_000_000);
+    await ctx.depositRewards(rewardAmount);
+
+    // Record B's balance before add-more
+    const bBalBefore = BigInt(await ctx.getBalance(userB.publicKey));
+    const aBalBefore = BigInt(await ctx.getBalance(userA.publicKey));
+
+    // A adds more stake on behalf of B — triggers auto-claim to B
+    await ctx.stakeOnBehalf(userA, userAToken, userB.publicKey, BigInt(1_000_000_000));
+
+    const bBalAfter = BigInt(await ctx.getBalance(userB.publicKey));
+    const aBalAfter = BigInt(await ctx.getBalance(userA.publicKey));
+
+    const bGain = bBalAfter - bBalBefore;
+    // A should NOT have gained lamports from the auto-claim (only lost tx fees)
+    const aGain = aBalAfter - aBalBefore;
+
+    if (bGain <= 0n) {
+      throw new Error(`B should have received auto-claimed rewards, got ${bGain}`);
+    }
+    console.log(`    B auto-claimed ${bGain} lamports`);
+    console.log(`    A balance delta: ${aGain} (should be negative from fees)`);
+    if (aGain > 0n) {
+      throw new Error('A should not have gained lamports from auto-claim');
+    }
+
+    // Verify combined stake amount
+    const userStakeState = await ctx.readUserStake(userB.publicKey);
+    if (userStakeState.amount !== totalTokens) {
+      throw new Error(`Expected combined stake ${totalTokens}, got ${userStakeState.amount}`);
+    }
+    console.log('    Add-more auto-claim goes to beneficiary: OK');
   });
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
