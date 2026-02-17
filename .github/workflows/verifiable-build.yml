@@ -25,7 +25,7 @@ jobs:
       - name: Build program
         run: cargo build-sbf --workspace
 
-      - name: Start test validator with program
+      - name: Start test validator and deploy program (upgradeable)
         run: |
           solana config set --url http://localhost:8899 --keypair ~/.config/solana/id.json
           solana-test-validator \
@@ -33,9 +33,12 @@ jobs:
             --rpc-port 8899 \
             --faucet-port 9900 \
             --slots-per-epoch 32 \
-            --bpf-program 3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr target/deploy/chiefstaker.so \
             --log &
           sleep 5
+          solana airdrop 100
+          solana program deploy \
+            --program-id target/deploy/chiefstaker-keypair.json \
+            target/deploy/chiefstaker.so
 
       - uses: actions/setup-node@v4
         with:
