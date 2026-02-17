@@ -1,16 +1,19 @@
-//! Fix total_reward_debt and recover stranded rewards (authority only)
+//! Fix total_reward_debt and recover stranded rewards (program upgrade authority only)
 //!
 //! Existing pools bootstrapped `total_reward_debt` at 0 and only track
 //! incremental changes since the field was added.  This means the on-chain
 //! value can be off by a large constant, causing the stranded-reward formula
 //! to over-estimate what is owed and recover nothing.
 //!
-//! This authority-only instruction accepts the correct `total_reward_debt`
-//! computed off-chain, sets it, and recovers stranded SOL in one shot.
+//! This instruction accepts the correct `total_reward_debt` computed off-chain,
+//! sets it, and recovers stranded SOL in one shot.  It is gated on the program
+//! upgrade authority (not the pool authority) because it is a maintenance
+//! operation — token creators should not be able to manipulate reward debt.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
+    bpf_loader_upgradeable,
     entrypoint::ProgramResult,
     msg,
     pubkey::Pubkey,
@@ -26,7 +29,8 @@ use crate::{
 ///
 /// Accounts:
 /// 0. `[writable]` Pool account
-/// 1. `[signer]` Authority
+/// 1. `[signer]`   Program upgrade authority
+/// 2. `[]`         ProgramData account (derived from program_id)
 pub fn process_fix_total_reward_debt(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -36,6 +40,7 @@ pub fn process_fix_total_reward_debt(
 
     let pool_info = next_account_info(account_info_iter)?;
     let authority_info = next_account_info(account_info_iter)?;
+    let programdata_info = next_account_info(account_info_iter)?;
 
     // Load and validate pool
     if pool_info.owner != program_id {
@@ -52,14 +57,37 @@ pub fn process_fix_total_reward_debt(
         return Err(StakingError::InvalidPDA.into());
     }
 
-    // Authority checks
+    // Verify ProgramData account
+    let (expected_programdata, _) = Pubkey::find_program_address(
+        &[program_id.as_ref()],
+        &bpf_loader_upgradeable::id(),
+    );
+    if *programdata_info.key != expected_programdata {
+        return Err(StakingError::InvalidPDA.into());
+    }
+    if programdata_info.owner != &bpf_loader_upgradeable::id() {
+        return Err(StakingError::InvalidAccountOwner.into());
+    }
+
+    // Parse upgrade authority from ProgramData account
+    // Layout: [4 bytes state][8 bytes slot][1 byte option][32 bytes pubkey]
+    let programdata_data = programdata_info.try_borrow_data()?;
+    if programdata_data.len() < 45 {
+        return Err(StakingError::InvalidInstruction.into());
+    }
+    // Byte 12: Option discriminant (0=None/immutable, 1=Some)
+    if programdata_data[12] != 1 {
+        msg!("FixTotalRewardDebt: program is immutable (no upgrade authority)");
+        return Err(StakingError::AuthorityRenounced.into());
+    }
+    let upgrade_authority = Pubkey::try_from(&programdata_data[13..45])
+        .map_err(|_| StakingError::InvalidInstruction)?;
+
+    // Verify signer is the program upgrade authority
     if !authority_info.is_signer {
         return Err(StakingError::MissingRequiredSigner.into());
     }
-    if pool.is_authority_renounced() {
-        return Err(StakingError::AuthorityRenounced.into());
-    }
-    if pool.authority != *authority_info.key {
+    if *authority_info.key != upgrade_authority {
         return Err(StakingError::InvalidAuthority.into());
     }
 

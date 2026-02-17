@@ -166,7 +166,7 @@ pub enum StakingInstruction {
     /// 2. `[writable, signer]` User/owner
     CloseStakeAccount,
 
-    /// Fix total_reward_debt and recover stranded rewards (authority only)
+    /// Fix total_reward_debt and recover stranded rewards (program upgrade authority)
     ///
     /// Accepts the correct `total_reward_debt` computed off-chain, sets it,
     /// and recovers stranded SOL in one shot. Required because existing pools
@@ -174,7 +174,8 @@ pub enum StakingInstruction {
     ///
     /// Accounts:
     /// 0. `[writable]` Pool account
-    /// 1. `[signer]` Authority
+    /// 1. `[signer]`   Program upgrade authority
+    /// 2. `[]`         ProgramData account (derived from program_id)
     FixTotalRewardDebt {
         new_total_reward_debt: u128,
     },

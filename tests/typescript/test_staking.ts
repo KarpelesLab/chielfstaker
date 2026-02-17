@@ -386,10 +386,18 @@ function createFixTotalRewardDebtInstruction(
   data.writeBigUInt64LE(newDebt & BigInt('0xFFFFFFFFFFFFFFFF'), 1);
   data.writeBigUInt64LE((newDebt >> BigInt(64)) & BigInt('0xFFFFFFFFFFFFFFFF'), 9);
 
+  // Derive ProgramData account (BPF Loader Upgradeable PDA)
+  const BPF_LOADER_UPGRADEABLE = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
+  const [programData] = PublicKey.findProgramAddressSync(
+    [PROGRAM_ID.toBuffer()],
+    BPF_LOADER_UPGRADEABLE,
+  );
+
   return new TransactionInstruction({
     keys: [
       { pubkey: pool, isSigner: false, isWritable: true },
       { pubkey: authority, isSigner: true, isWritable: false },
+      { pubkey: programData, isSigner: false, isWritable: false },
     ],
     programId: PROGRAM_ID,
     data,
