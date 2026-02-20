@@ -26,18 +26,18 @@ pending = user_weighted * (acc_reward_per_weighted_share - snapshot) - claimed_r
 
 where `snapshot` is encoded in `reward_debt` and `claimed_rewards_wad` tracks cumulative payouts for frequency-independent claiming (claiming once or ten times yields the same total).
 
-**Immature rewards** are the gap between max-weight entitlement and time-weighted entitlement — SOL the staker has earned "on paper" but can't claim until their weight matures further. These stay in the pool and can be redistributed via `RecoverStrandedRewards`.
+**Immature rewards** are the gap between max-weight entitlement and time-weighted entitlement — SOL the staker has earned "on paper" but can't claim until their weight matures further. These stay in the pool and are eventually redistributed to all stakers.
 
 ### Additional Stakes (Restaking)
 
 When a staker adds more tokens to an existing position:
 
-1. **Auto-claim**: mature pending rewards are paid out immediately
-2. **Immature preservation**: unvested rewards are preserved as a credit in the new `reward_debt` (set below the baseline so `delta_rps > 0` from the start)
-3. **Weight blending**: `exp_start_factor` is recomputed as a weighted average of old and new contributions
-4. **Snapshot reset**: `claimed_rewards_wad` resets to 0 for the restructured position
+1. **Auto-claim**: vested pending rewards are paid out immediately
+2. **Snapshot reset**: `reward_debt` is set to `total_amount × acc_reward_per_weighted_share` and `claimed_rewards_wad` resets to 0 — the position starts fresh from the current accumulator
+3. **Weight blending**: `exp_start_factor` is recomputed as a weighted average of old and new contributions, so the effective weight is continuous (e.g. 1M at 50% maturity + 1M new = 2M at 25%)
+4. **Unvested forfeiture**: immature rewards from the prior position are forfeited to prevent a reward inflation exploit (staking dust to repeatedly extract rewards at full weight)
 
-The immature credit gradually becomes claimable as the combined position's weight matures. At full maturity, 100% of the preserved credit is recoverable.
+The weight is continuous across the add-stake boundary — adding tokens never changes the absolute weighted stake, only the max potential. For example, 1M tokens at 50% maturity (500K weight) plus 1M new tokens yields 2M at 25% maturity (still 500K weight), growing toward 2M.
 
 Rewards can be deposited directly via instruction or sent to the pool PDA (e.g., from pump.fun fee revenue) and synced.
 
@@ -75,8 +75,10 @@ Rewards can be deposited directly via instruction or sent to the pool PDA (e.g.,
 | 10 | `CompleteUnstake` | Finish unstake after cooldown elapsed |
 | 11 | `CancelUnstakeRequest` | Cancel a pending unstake request |
 | 12 | `CloseStakeAccount` | Close zero-balance stake account to reclaim rent |
-| 13 | `RecoverStrandedRewards` | Redistribute stranded rewards (permissionless) |
+| 13 | `FixTotalRewardDebt` | Fix total_reward_debt and recover stranded rewards (upgrade authority) |
 | 14 | `SetPoolMetadata` | Set pool name, tags, and URL (permissionless) |
+| 15 | `TakeFeeOwnership` | Claim pump.fun creator fee revenue for the pool |
+| 16 | `StakeOnBehalf` | Stake tokens on behalf of another user (beneficiary) |
 
 ## Pool Settings
 
@@ -127,9 +129,16 @@ This runs `solana-verify verify-from-repo --remote` against the deployed program
 
 ## Changelog
 
-### v3 (current)
+### v4 (current)
 
-- **Immature rewards preservation**: staking additional tokens no longer loses unvested SOL rewards. The auto-claim pays mature rewards and the immature portion is preserved as a credit in the new `reward_debt`, gradually unlocking as the combined position matures.
+- **Add-stake reward reset**: on additional stake, `reward_debt` is reset to the full current snapshot (`total_amount × acc_rps`) and `claimed_rewards_wad` is zeroed. Vested rewards are auto-claimed; unvested rewards are forfeited. This fixes a critical reward inflation exploit where repeatedly staking dust and claiming could extract rewards at full weight instead of actual maturity-weighted share.
+- **StakeOnBehalf**: new instruction allowing any signer to stake tokens on behalf of a beneficiary. The staker pays rent and provides tokens; the beneficiary owns the position and receives auto-claimed rewards.
+- **TakeFeeOwnership**: new instruction to claim pump.fun creator fee revenue for the pool, setting the pool PDA as sole fee recipient and revoking the authority.
+- **FixTotalRewardDebt**: new admin instruction (requires program upgrade authority) to correct `total_reward_debt` and recover stranded SOL. Replaces the removed `RecoverStrandedRewards`.
+- **solana-security-txt**: embedded security contact info readable by explorers and auditors.
+
+### v3
+
 - **Legacy account realloc fix**: `maybe_realloc` uses system program CPI (`system_instruction::transfer`) instead of direct lamport manipulation, fixing "instruction spent from the balance of an account it does not own" for legacy accounts.
 - **System program as trailing account**: instructions that call `maybe_realloc` (claim, unstake, request unstake, complete unstake, cancel unstake) accept an optional trailing system program account for legacy account resizing.
 - **Frequency-independent claims**: `claimed_rewards_wad` field tracks cumulative payouts so claiming once or many times yields the same total. Prevents repeated-claim exploits.
@@ -157,8 +166,10 @@ programs/chiefstaker/src/
     complete_unstake.rs           # CompleteUnstake
     cancel_unstake.rs             # CancelUnstakeRequest
     close_stake.rs                # CloseStakeAccount
-    recover_stranded.rs           # RecoverStrandedRewards
+    fix_total_reward_debt.rs      # FixTotalRewardDebt
     set_metadata.rs               # SetPoolMetadata
+    take_fee_ownership.rs         # TakeFeeOwnership
+    stake_on_behalf.rs            # StakeOnBehalf
 tests/typescript/
   test_staking.ts                 # E2E tests
 ```

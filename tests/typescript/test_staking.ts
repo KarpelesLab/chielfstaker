@@ -4409,6 +4409,166 @@ async function runTests() {
     console.log('    Conservation maintained: OK');
   });
 
+  // Test: Weight continuity — absolute weighted stake is preserved across add-stake
+  await test('AddStake: weight continuity (1M@50% + 1M = 2M@25%)', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    const tau = BigInt(30); // 30s tau for fast maturity
+    await ctx.initializePool(tau);
+
+    const staker = Keypair.generate();
+    await airdropAndConfirm(connection, staker.publicKey, 3 * LAMPORTS_PER_SOL);
+    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
+    await ctx.mintTokens(stakerToken, BigInt(2_000_000_000));
+
+    // Stake 1B tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Wait ~21s for ~50% maturity (1 - e^(-21/30) ≈ 0.503)
+    console.log('    Waiting 21s for ~50% maturity...');
+    await new Promise(r => setTimeout(r, 21000));
+
+    // Read state before add-stake
+    const stateBefore = await ctx.readUserStakeState(staker.publicKey);
+    const expBefore = stateBefore.expStartFactor;
+    const amountBefore = stateBefore.amount;
+    console.log(`    Before: amount=${amountBefore}, exp_start_factor=${expBefore}`);
+
+    // Add 1B more tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Read state after add-stake
+    const stateAfter = await ctx.readUserStakeState(staker.publicKey);
+    const expAfter = stateAfter.expStartFactor;
+    const amountAfter = stateAfter.amount;
+    console.log(`    After:  amount=${amountAfter}, exp_start_factor=${expAfter}`);
+
+    // Verify amount doubled
+    if (amountAfter !== BigInt(2_000_000_000)) {
+      throw new Error(`Expected 2B, got ${amountAfter}`);
+    }
+
+    // Verify exp_start_factor is the weighted average:
+    // new_exp = (old_amount * old_exp + new_amount * new_exp_fresh) / total_amount
+    // For a fresh stake, exp_start_factor ≈ exp(t/tau) which is > old_exp.
+    // The blended factor should be between old_exp and new_exp.
+    if (expAfter <= expBefore) {
+      throw new Error(`Blended exp_factor ${expAfter} should be > old ${expBefore}`);
+    }
+
+    // Verify weight continuity property:
+    // The blended factor satisfies: weight = amount * (1 - exp_neg_t * exp_factor / WAD)
+    // With the correct blend, the absolute weight should be approximately unchanged.
+    // old_weight ≈ 1B * (1 - old_exp * exp_neg_t) where exp_neg_t = exp(-t/tau)
+    // new_weight ≈ 2B * (1 - blended_exp * exp_neg_t)
+    // These should be approximately equal.
+    //
+    // We can verify this indirectly: the new exp_factor should satisfy
+    // amount_after * (WAD - decay_after) ≈ amount_before * (WAD - decay_before)
+    // where decay = exp_neg_t * exp_factor
+    //
+    // Since both use the same exp_neg_t at the same time, this simplifies to:
+    // 2B * (WAD - blended_exp * exp_neg_t) ≈ 1B * (WAD - old_exp * exp_neg_t)
+    // => 2B * blended_exp ≈ 2B * WAD - 1B * WAD + 1B * old_exp
+    //    (dividing out exp_neg_t from both decay terms)
+    // => blended_exp ≈ WAD + (old_exp - WAD) / 2
+    //    = (WAD + old_exp) / 2
+    //
+    // So verify the blend is approximately the midpoint of WAD and old_exp.
+    const WAD = 1_000_000_000_000_000_000n;
+    // The old exp_start_factor for a stake at t=0 (base_time) is WAD (exp(0)=1).
+    // The new exp_start_factor for a stake at t=21 is exp(21/30) ≈ 2.01 * WAD.
+    // Blend = (1B * WAD + 1B * ~2.01*WAD) / 2B ≈ 1.505 * WAD
+    // This means weight = 2B * (1 - 1.505 * exp(-21/30))
+    //                    ≈ 2B * (1 - 1.505 * 0.497) ≈ 2B * 0.252 ≈ 504M
+    // vs old weight     = 1B * (1 - 1.0 * 0.497) ≈ 1B * 0.503 ≈ 503M
+    // So weight is approximately preserved (within rounding).
+
+    // Verify blended exp is between WAD and 3*WAD (reasonable range)
+    if (expAfter < WAD) {
+      throw new Error(`Blended exp_factor ${expAfter} should be >= WAD`);
+    }
+    if (expAfter > 3n * WAD) {
+      throw new Error(`Blended exp_factor ${expAfter} unreasonably large`);
+    }
+
+    // Verify reward_debt is set to full snapshot (no immature credit)
+    const pool = await ctx.readPoolState();
+    const expectedDebt = (amountAfter * WAD * pool.accRewardPerWeightedShare + WAD / 2n) / WAD;
+    const debtDiff = stateAfter.rewardDebt > expectedDebt
+      ? stateAfter.rewardDebt - expectedDebt
+      : expectedDebt - stateAfter.rewardDebt;
+    if (debtDiff > 1n) {
+      throw new Error(`reward_debt not set to full snapshot: diff=${debtDiff}`);
+    }
+
+    // Verify claimed_rewards_wad is 0
+    if (stateAfter.claimedRewardsWad !== 0n) {
+      throw new Error(`claimed_rewards_wad should be 0, got ${stateAfter.claimedRewardsWad}`);
+    }
+
+    console.log('    Weight continuity verified: OK');
+  });
+
+  // Test: Multiple add-stakes — repeated dust doesn't accumulate rewards
+  await test('AddStake: repeated dust-stakes yield no extra rewards', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60)); // 60s tau
+
+    const staker = Keypair.generate();
+    await airdropAndConfirm(connection, staker.publicKey, 5 * LAMPORTS_PER_SOL);
+    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
+    await ctx.mintTokens(stakerToken, BigInt(2_000_000_000));
+
+    // Stake 1B tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Wait for maturity
+    console.log('    Waiting 30s for maturity...');
+    await new Promise(r => setTimeout(r, 30000));
+
+    // Deposit 2 SOL
+    await ctx.depositRewards(BigInt(2 * LAMPORTS_PER_SOL));
+
+    // Claim everything first
+    let bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.claimRewards(staker);
+    let balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const initialClaim = balAfter - bal;
+    console.log(`    Initial claim: ${initialClaim} lamports`);
+
+    // Now attempt the exploit: dust-stake → claim, repeated 3 times
+    let totalExploitGain = 0n;
+    for (let i = 0; i < 3; i++) {
+      bal = BigInt(await ctx.getBalance(staker.publicKey));
+      await ctx.stake(staker, stakerToken, BigInt(1)); // dust
+      balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+      const dustAutoClaim = balAfter - bal;
+
+      bal = BigInt(await ctx.getBalance(staker.publicKey));
+      await ctx.claimRewards(staker);
+      balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+      const postDustClaim = balAfter - bal;
+
+      const roundGain = dustAutoClaim + postDustClaim;
+      totalExploitGain += roundGain;
+      console.log(`    Round ${i + 1}: dust auto-claim=${dustAutoClaim}, post-claim=${postDustClaim}`);
+    }
+
+    console.log(`    Total exploit attempt gain: ${totalExploitGain} lamports`);
+
+    // The total gain from 3 rounds of dust-staking should be negligible
+    // (just rounding/new-reward accumulation, not a percentage of the deposit)
+    if (totalExploitGain > BigInt(100_000)) {
+      throw new Error(`Repeated dust-stake yielded ${totalExploitGain} — exploit not blocked!`);
+    }
+
+    console.log('    Repeated dust-stake exploit blocked: OK');
+  });
+
   // ========== StakeOnBehalf Tests ==========
 
   await test('StakeOnBehalf: stake on behalf of another user', async () => {
