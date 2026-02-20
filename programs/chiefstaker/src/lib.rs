@@ -166,18 +166,10 @@ pub enum StakingInstruction {
     /// 2. `[writable, signer]` User/owner
     CloseStakeAccount,
 
-    /// Fix total_reward_debt and recover stranded rewards (program upgrade authority)
-    ///
-    /// Accepts the correct `total_reward_debt` computed off-chain, sets it,
-    /// and recovers stranded SOL in one shot. Required because existing pools
-    /// bootstrapped total_reward_debt at 0 and only track incremental changes.
-    ///
-    /// Accounts:
-    /// 0. `[writable]` Pool account
-    /// 1. `[signer]`   Program upgrade authority
-    /// 2. `[]`         ProgramData account (derived from program_id)
-    FixTotalRewardDebt {
-        new_total_reward_debt: u128,
+    /// DEPRECATED: Slot 13 reserved for ABI compatibility (was FixTotalRewardDebt).
+    /// Always returns InvalidInstruction.
+    DeprecatedFixTotalRewardDebt {
+        _unused: u128,
     },
 
     /// Set (create or update) pool metadata for explorer display (permissionless)
@@ -331,9 +323,9 @@ pub fn process_instruction(
             msg!("Instruction: CloseStakeAccount");
             process_close_stake_account(program_id, accounts)
         }
-        StakingInstruction::FixTotalRewardDebt { new_total_reward_debt } => {
-            msg!("Instruction: FixTotalRewardDebt");
-            process_fix_total_reward_debt(program_id, accounts, new_total_reward_debt)
+        StakingInstruction::DeprecatedFixTotalRewardDebt { .. } => {
+            msg!("Instruction: FixTotalRewardDebt (deprecated, no-op)");
+            Err(ProgramError::InvalidInstructionData)
         }
         StakingInstruction::SetPoolMetadata => {
             msg!("Instruction: SetPoolMetadata");

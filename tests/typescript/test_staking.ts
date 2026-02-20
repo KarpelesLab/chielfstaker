@@ -1045,7 +1045,7 @@ async function runTests() {
   const connection = new Connection('http://localhost:8899', 'confirmed');
   const payer = Keypair.generate();
 
-  // Load the program deployer keypair (upgrade authority for FixTotalRewardDebt)
+  // Load the program deployer keypair (upgrade authority)
   const solanaKeypairPath = path.join(
     process.env.HOME || require('os').homedir(),
     '.config', 'solana', 'id.json',
@@ -3060,8 +3060,7 @@ async function runTests() {
   // ============================================
   // SOL CONSERVATION & RECOVERY TESTS
   // ============================================
-  // Verify no SOL is lost (dead/stranded) from additional stakes,
-  // and that FixTotalRewardDebt works correctly.
+  // Verify no SOL is lost (dead/stranded) from additional stakes.
 
   console.log('\n--- SOL Conservation & Recovery Tests ---\n');
 
@@ -3163,121 +3162,13 @@ async function runTests() {
 
     // Extra check: pool remaining should not exceed deposits.
     // At tau=60 with short waits (~15% weight), most rewards remain in pool as
-    // stranded/unclaimed — this is expected behavior, not a bug. The stranded rewards
-    // would be redistributed via FixTotalRewardDebt. We just verify the pool
+    // stranded/unclaimed — this is expected behavior, not a bug. These rewards
+    // are eventually redistributed to all stakers. We just verify the pool
     // isn't holding MORE than deposited (which would indicate SOL creation).
     if (poolRewardsRemaining > totalDeposited + BigInt(100_000)) {
       throw new Error(`Pool has more than deposited: ${poolRewardsRemaining} > ${totalDeposited}`);
     }
     console.log('    Conservation: OK');
-  });
-
-  // Test: FixTotalRewardDebt doesn't steal from claimable rewards
-  await test('Recovery: does not steal claimable rewards', async () => {
-    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
-    await ctx.setup();
-    await ctx.createMint(9);
-    await ctx.initializePool(BigInt(60)); // 60s tau (minimum)
-
-    const staker = Keypair.generate();
-    await airdropAndConfirm(connection, staker.publicKey, 3 * LAMPORTS_PER_SOL);
-
-    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
-    await ctx.mintTokens(stakerToken, BigInt(1_000_000_000));
-    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
-
-    // Wait for weight accumulation (~22% at 15s/60s tau)
-    console.log('    Waiting 15s for weight accumulation...');
-    await new Promise(r => setTimeout(r, 15000));
-
-    // Deposit 1 SOL — with single staker at ~22% weight, they should get ~22% of it
-    const depositAmount = BigInt(LAMPORTS_PER_SOL);
-    await ctx.depositRewards(depositAmount);
-
-    // Read pool state before recovery
-    const stateBefore = await ctx.readPoolState();
-    console.log(`    Before recovery: lastSynced=${stateBefore.lastSyncedLamports}, totalRewardDebt=${stateBefore.totalRewardDebt}`);
-
-    // Call FixTotalRewardDebt (pass current debt — correct for fresh pools)
-    await ctx.fixTotalRewardDebt(stateBefore.totalRewardDebt);
-
-    const stateAfter = await ctx.readPoolState();
-    const recovered = stateBefore.lastSyncedLamports - stateAfter.lastSyncedLamports;
-    console.log(`    After recovery: lastSynced=${stateAfter.lastSyncedLamports}, recovered=${recovered}`);
-
-    // Now sync to redistribute any recovered amount
-    await ctx.syncRewards();
-
-    // Staker claims all rewards
-    const balBefore = BigInt(await ctx.getBalance(staker.publicKey));
-    await ctx.claimRewards(staker);
-    const balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-    const claimed = balAfter - balBefore;
-
-    console.log(`    Deposited: ${depositAmount}, Claimed: ${claimed}`);
-
-    // Key check: recovery must not steal the staker's claimable rewards.
-    // With tau=60 and 15s wait, staker has ~22% weight → gets ~22% of deposit.
-    // After recovery + sync, stranded portion is redistributed back, so staker gets more.
-    // Check that staker gets at least 15% of deposit (conservative lower bound).
-    const claimPercent = Number(claimed * BigInt(100)) / Number(depositAmount);
-    console.log(`    Claim percentage: ${claimPercent.toFixed(1)}%`);
-
-    if (claimed < depositAmount * BigInt(15) / BigInt(100)) {
-      throw new Error(`Recovery stole rewards! Claimed ${claimed} < 15% of deposited ${depositAmount}`);
-    }
-
-    // Fully unstake
-    await ctx.unstake(staker, stakerToken, BigInt(1_000_000_000));
-
-    // Pool should have minimal remaining
-    const poolBalance = BigInt(await ctx.getBalance(ctx.poolPDA));
-    const poolAccountInfo = await connection.getAccountInfo(ctx.poolPDA);
-    const rentExempt = BigInt(await connection.getMinimumBalanceForRentExemption(poolAccountInfo!.data.length));
-    const remaining = poolBalance - rentExempt;
-
-    console.log(`    Pool remaining after full exit: ${remaining} lamports`);
-    // Should not be significantly negative (overdraw) — pool balance >= rent exempt
-    if (poolBalance < rentExempt) {
-      throw new Error(`Pool overdraw! Balance ${poolBalance} < rent ${rentExempt}`);
-    }
-  });
-
-  // Test: FixTotalRewardDebt is idempotent (second call recovers nothing extra)
-  await test('Recovery: idempotent (second call recovers nothing)', async () => {
-    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
-    await ctx.setup();
-    await ctx.createMint(9);
-    await ctx.initializePool(BigInt(60)); // 60s tau (minimum)
-
-    const staker = Keypair.generate();
-    await airdropAndConfirm(connection, staker.publicKey, 3 * LAMPORTS_PER_SOL);
-
-    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
-    await ctx.mintTokens(stakerToken, BigInt(1_000_000_000));
-    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
-
-    // Deposit and wait for weight accumulation
-    await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL));
-    console.log('    Waiting 10s for weight accumulation...');
-    await new Promise(r => setTimeout(r, 10000));
-
-    // First recovery
-    const stateBeforeRecovery = await ctx.readPoolState();
-    await ctx.fixTotalRewardDebt(stateBeforeRecovery.totalRewardDebt);
-    const stateAfter1 = await ctx.readPoolState();
-
-    // Second recovery — should be no-op (debt already correct)
-    await ctx.fixTotalRewardDebt(stateAfter1.totalRewardDebt);
-    const stateAfter2 = await ctx.readPoolState();
-
-    console.log(`    After 1st recovery: lastSynced=${stateAfter1.lastSyncedLamports}`);
-    console.log(`    After 2nd recovery: lastSynced=${stateAfter2.lastSyncedLamports}`);
-
-    if (stateAfter1.lastSyncedLamports !== stateAfter2.lastSyncedLamports) {
-      throw new Error(`Recovery not idempotent: ${stateAfter1.lastSyncedLamports} -> ${stateAfter2.lastSyncedLamports}`);
-    }
-    console.log('    Idempotent: OK');
   });
 
   // Test: total_reward_debt is tracked correctly through stake/claim/unstake lifecycle
@@ -3406,11 +3297,6 @@ async function runTests() {
     console.log('    Waiting 6s...');
     await new Promise(r => setTimeout(r, 6000));
 
-    // Recovery — pick up any rounding dust
-    const stateBeforeRecovery = await ctx.readPoolState();
-    await ctx.fixTotalRewardDebt(stateBeforeRecovery.totalRewardDebt);
-    await ctx.syncRewards();
-
     // Phase 3: everyone claims and unstakes
     let totalClaimed = autoClaimedSOL;
     for (let i = 0; i < numStakers; i++) {
@@ -3463,48 +3349,6 @@ async function runTests() {
     }
 
     console.log(`    Conservation OK (diff=${diff} lamports)`);
-  });
-
-  // Test: FixTotalRewardDebt bounded — pool lamports never go below rent exempt
-  await test('Recovery: pool balance stays above rent exempt', async () => {
-    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
-    await ctx.setup();
-    await ctx.createMint(9);
-    await ctx.initializePool(BigInt(60)); // 60s tau (minimum)
-
-    const staker = Keypair.generate();
-    await airdropAndConfirm(connection, staker.publicKey, 3 * LAMPORTS_PER_SOL);
-
-    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
-    await ctx.mintTokens(stakerToken, BigInt(1_000_000_000));
-    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
-
-    // Deposit a tiny amount of rewards
-    await ctx.depositRewards(BigInt(10_000)); // 10K lamports
-
-    console.log('    Waiting 10s...');
-    await new Promise(r => setTimeout(r, 10000));
-
-    // Claim everything
-    await ctx.claimRewards(staker);
-
-    // Now call recovery — pool has near-zero rewards left
-    // This should NOT make pool insolvent
-    const stateBeforeRecovery = await ctx.readPoolState();
-    await ctx.fixTotalRewardDebt(stateBeforeRecovery.totalRewardDebt);
-
-    const poolBalance = BigInt(await ctx.getBalance(ctx.poolPDA));
-    const poolAccountInfo = await connection.getAccountInfo(ctx.poolPDA);
-    const rentExempt = BigInt(await connection.getMinimumBalanceForRentExemption(poolAccountInfo!.data.length));
-
-    console.log(`    Pool balance: ${poolBalance}, rent exempt: ${rentExempt}`);
-    if (poolBalance < rentExempt) {
-      throw new Error(`Pool went below rent exempt! Balance ${poolBalance} < ${rentExempt}`);
-    }
-
-    // Unstake to clean up
-    await ctx.unstake(staker, stakerToken, BigInt(1_000_000_000));
-    console.log('    Pool solvency: OK');
   });
 
   // ==================== METADATA TESTS ====================

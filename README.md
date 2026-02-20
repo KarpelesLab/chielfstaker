@@ -75,7 +75,7 @@ Rewards can be deposited directly via instruction or sent to the pool PDA (e.g.,
 | 10 | `CompleteUnstake` | Finish unstake after cooldown elapsed |
 | 11 | `CancelUnstakeRequest` | Cancel a pending unstake request |
 | 12 | `CloseStakeAccount` | Close zero-balance stake account to reclaim rent |
-| 13 | `FixTotalRewardDebt` | Fix total_reward_debt and recover stranded rewards (upgrade authority) |
+| 13 | ~~`FixTotalRewardDebt`~~ | Deprecated (no-op, returns error) |
 | 14 | `SetPoolMetadata` | Set pool name, tags, and URL (permissionless) |
 | 15 | `TakeFeeOwnership` | Claim pump.fun creator fee revenue for the pool |
 | 16 | `StakeOnBehalf` | Stake tokens on behalf of another user (beneficiary) |
@@ -134,7 +134,7 @@ This runs `solana-verify verify-from-repo --remote` against the deployed program
 - **Add-stake reward reset**: on additional stake, `reward_debt` is reset to the full current snapshot (`total_amount × acc_rps`) and `claimed_rewards_wad` is zeroed. Vested rewards are auto-claimed; unvested rewards are forfeited. This fixes a critical reward inflation exploit where repeatedly staking dust and claiming could extract rewards at full weight instead of actual maturity-weighted share.
 - **StakeOnBehalf**: new instruction allowing any signer to stake tokens on behalf of a beneficiary. The staker pays rent and provides tokens; the beneficiary owns the position and receives auto-claimed rewards.
 - **TakeFeeOwnership**: new instruction to claim pump.fun creator fee revenue for the pool, setting the pool PDA as sole fee recipient and revoking the authority.
-- **FixTotalRewardDebt**: new admin instruction (requires program upgrade authority) to correct `total_reward_debt` and recover stranded SOL. Replaces the removed `RecoverStrandedRewards`.
+- **FixTotalRewardDebt** (deprecated): was a one-time admin instruction to correct `total_reward_debt`. Slot 13 retained as no-op for ABI compatibility.
 - **solana-security-txt**: embedded security contact info readable by explorers and auditors.
 
 ### v3
@@ -166,7 +166,6 @@ programs/chiefstaker/src/
     complete_unstake.rs           # CompleteUnstake
     cancel_unstake.rs             # CancelUnstakeRequest
     close_stake.rs                # CloseStakeAccount
-    fix_total_reward_debt.rs      # FixTotalRewardDebt
     set_metadata.rs               # SetPoolMetadata
     take_fee_ownership.rs         # TakeFeeOwnership
     stake_on_behalf.rs            # StakeOnBehalf
