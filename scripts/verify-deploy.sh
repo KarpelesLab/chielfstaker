@@ -6,6 +6,8 @@
 
 set -e
 
+export PATH="$HOME/.cargo/bin:$PATH"
+
 PROGRAM_ID="3Ecf8gyRURyrBtGHS1XAVXyQik5PqgDch4VkxrH4ECcr"
 REPO_URL="https://github.com/KarpelesLab/chiefstaker"
 LIBRARY_NAME="chiefstaker"
