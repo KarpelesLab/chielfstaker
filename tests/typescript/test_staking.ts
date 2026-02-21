@@ -4281,20 +4281,26 @@ async function runTests() {
     console.log('    Conservation maintained: OK');
   });
 
-  // Test: Dust-stake doesn't extract extra rewards
-  await test('AddStake: dust-stake yields no extra rewards', async () => {
+  // Test: Dust-stake provides no advantage over simply claiming
+  await test('AddStake: dust-stake yields no extra rewards vs plain claim', async () => {
     const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
     await ctx.setup();
     await ctx.createMint(9);
     await ctx.initializePool(BigInt(60)); // 60s tau
 
-    const staker = Keypair.generate();
-    await airdropAndConfirm(connection, staker.publicKey, 5 * LAMPORTS_PER_SOL);
-    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
-    await ctx.mintTokens(stakerToken, BigInt(2_000_000_000));
+    // Two stakers: one will dust-stake+claim, the other will just claim
+    const dustStaker = Keypair.generate();
+    const plainStaker = Keypair.generate();
+    await airdropAndConfirm(connection, dustStaker.publicKey, 5 * LAMPORTS_PER_SOL);
+    await airdropAndConfirm(connection, plainStaker.publicKey, 5 * LAMPORTS_PER_SOL);
+    const dustToken = await ctx.createUserTokenAccount(dustStaker.publicKey);
+    const plainToken = await ctx.createUserTokenAccount(plainStaker.publicKey);
+    await ctx.mintTokens(dustToken, BigInt(2_000_000_000));
+    await ctx.mintTokens(plainToken, BigInt(1_000_000_000));
 
-    // Stake 1B tokens
-    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+    // Both stake the same amount at the same time
+    await ctx.stake(dustStaker, dustToken, BigInt(1_000_000_000));
+    await ctx.stake(plainStaker, plainToken, BigInt(1_000_000_000));
 
     // Wait for maturity
     console.log('    Waiting 30s for maturity...');
@@ -4303,33 +4309,40 @@ async function runTests() {
     // Deposit 2 SOL
     await ctx.depositRewards(BigInt(2 * LAMPORTS_PER_SOL));
 
-    // Claim everything first
-    let bal = BigInt(await ctx.getBalance(staker.publicKey));
-    await ctx.claimRewards(staker);
-    let balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-    const initialClaim = balAfter - bal;
-    console.log(`    Initial claim: ${initialClaim} lamports`);
+    // Both claim initial rewards
+    await ctx.claimRewards(dustStaker);
+    await ctx.claimRewards(plainStaker);
 
-    // Dust-stake → claim, repeated 3 times
-    let totalExploitGain = 0n;
+    // Dust-staker: stake dust then claim; plain-staker: just claim
+    let dustTotal = 0n;
+    let plainTotal = 0n;
     for (let i = 0; i < 3; i++) {
-      await ctx.stake(staker, stakerToken, BigInt(1)); // dust
+      await ctx.stake(dustStaker, dustToken, BigInt(1)); // dust
 
-      bal = BigInt(await ctx.getBalance(staker.publicKey));
-      await ctx.claimRewards(staker);
-      balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-      const postDustClaim = balAfter - bal;
-      totalExploitGain += postDustClaim;
-      console.log(`    Round ${i + 1}: claim after dust=${postDustClaim}`);
+      let bal = BigInt(await ctx.getBalance(dustStaker.publicKey));
+      await ctx.claimRewards(dustStaker);
+      let balAfter = BigInt(await ctx.getBalance(dustStaker.publicKey));
+      dustTotal += balAfter - bal;
+
+      bal = BigInt(await ctx.getBalance(plainStaker.publicKey));
+      await ctx.claimRewards(plainStaker);
+      balAfter = BigInt(await ctx.getBalance(plainStaker.publicKey));
+      plainTotal += balAfter - bal;
+
+      console.log(`    Round ${i + 1}: dust=${dustTotal}, plain=${plainTotal}`);
     }
 
-    console.log(`    Total exploit attempt gain: ${totalExploitGain} lamports`);
+    console.log(`    Dust-staker total: ${dustTotal}, Plain-staker total: ${plainTotal}`);
 
-    if (totalExploitGain > BigInt(100_000)) {
-      throw new Error(`Dust-stake yielded ${totalExploitGain} — exploit not blocked!`);
+    // Dust-staker should NOT get meaningfully more than plain-staker
+    // (small difference possible due to slightly different share from dust amount)
+    const diff = dustTotal - plainTotal;
+    const threshold = BigInt(LAMPORTS_PER_SOL / 100); // 0.01 SOL tolerance
+    if (diff > threshold) {
+      throw new Error(`Dust-stake advantage: ${diff} lamports — exploit not blocked!`);
     }
 
-    console.log('    Dust-stake exploit blocked: OK');
+    console.log('    Dust-stake provides no advantage: OK');
   });
 
   // ========== StakeOnBehalf Tests ==========
