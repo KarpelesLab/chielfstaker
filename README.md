@@ -32,12 +32,11 @@ where `snapshot` is encoded in `reward_debt` and `claimed_rewards_wad` tracks cu
 
 When a staker adds more tokens to an existing position:
 
-1. **Auto-claim**: vested pending rewards are paid out immediately
-2. **Snapshot reset**: `reward_debt` is set to `total_amount × acc_reward_per_weighted_share` and `claimed_rewards_wad` resets to 0 — the position starts fresh from the current accumulator
-3. **Weight blending**: `exp_start_factor` is recomputed as a weighted average of old and new contributions, so the effective weight is continuous (e.g. 1M at 50% maturity + 1M new = 2M at 25%)
-4. **Unvested forfeiture**: immature rewards from the prior position are forfeited to prevent a reward inflation exploit (staking dust to repeatedly extract rewards at full weight)
+1. **Maturity preserved**: `exp_start_factor` is unchanged — maturity depends only on when the user first staked, not on amount
+2. **Pending rewards preserved**: existing pending rewards (both vested and immature) stay exactly the same
+3. **New tokens start fresh**: `reward_debt += new_amount × acc_reward_per_weighted_share` so new tokens don't earn rewards deposited before the add-stake
 
-The weight is continuous across the add-stake boundary — adding tokens never changes the absolute weighted stake, only the max potential. For example, 1M tokens at 50% maturity (500K weight) plus 1M new tokens yields 2M at 25% maturity (still 500K weight), growing toward 2M.
+Adding tokens increases the staker's max-weight entitlement but does not change their maturity percentage. For example, a staker at 50% maturity who doubles their stake goes from earning 50% of 1M to 50% of 2M — the maturity percentage is unchanged, and pending rewards carry over seamlessly.
 
 Rewards can be deposited directly via instruction or sent to the pool PDA (e.g., from pump.fun fee revenue) and synced.
 
@@ -131,8 +130,8 @@ This runs `solana-verify verify-from-repo --remote` against the deployed program
 
 ### v4 (current)
 
-- **Add-stake reward reset**: on additional stake, `reward_debt` is reset to the full current snapshot (`total_amount × acc_rps`) and `claimed_rewards_wad` is zeroed. Vested rewards are auto-claimed; unvested rewards are forfeited. This fixes a critical reward inflation exploit where repeatedly staking dust and claiming could extract rewards at full weight instead of actual maturity-weighted share.
-- **StakeOnBehalf**: new instruction allowing any signer to stake tokens on behalf of a beneficiary. The staker pays rent and provides tokens; the beneficiary owns the position and receives auto-claimed rewards.
+- **Add-stake maturity preservation**: on additional stake, `exp_start_factor` is unchanged (maturity depends only on start time, not amount). Pending rewards (vested and immature) carry over seamlessly. New tokens get a fresh `reward_debt` snapshot so they don't earn prior rewards. This prevents the dust-stake exploit while preserving all earned SOL across add-stake operations.
+- **StakeOnBehalf**: new instruction allowing any signer to stake tokens on behalf of a beneficiary. The staker pays rent and provides tokens; the beneficiary owns the position.
 - **TakeFeeOwnership**: new instruction to claim pump.fun creator fee revenue for the pool, setting the pool PDA as sole fee recipient and revoking the authority.
 - **FixTotalRewardDebt** (deprecated): was a one-time admin instruction to correct `total_reward_debt`. Slot 13 retained as no-op for ABI compatibility.
 - **solana-security-txt**: embedded security contact info readable by explorers and auditors.

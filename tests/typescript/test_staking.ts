@@ -2933,11 +2933,9 @@ async function runTests() {
     await ctx.syncPool(); // Rebase before weighted operations
     await ctx.stake(dave, daveToken, daveAmount); // Dave stakes 3B
 
-    // Bob adds 2B more (auto-claims pending rewards)
-    const bobReward1 = await measureReward('bob', bob, () =>
-      ctx.stake(bob, bobToken, BigInt(2) * BILLION)
-    );
-    console.log(`    Bob auto-claim on add-stake: ${bobReward1} lamports`);
+    // Bob adds 2B more (no auto-claim — pending stays the same)
+    await ctx.stake(bob, bobToken, BigInt(2) * BILLION);
+    console.log(`    Bob added 2B more tokens`);
 
     await ctx.depositRewards(BigInt(LAMPORTS_PER_SOL)); // Deposit 1 SOL
     totalDeposited += BigInt(LAMPORTS_PER_SOL);
@@ -4059,16 +4057,17 @@ async function runTests() {
     console.log('    Sandwich attack mitigated: OK');
   });
 
-  // ─── Add-Stake Reward Reset Tests ──────────────────────────────────────────
+  // ─── Add-Stake Tests ─────────────────────────────────────────────────────────
   //
-  // After fixing the immature credit exploit, adding more stake now resets the
-  // reward snapshot cleanly. Unvested rewards are forfeited to prevent the
-  // dust-stake-then-claim inflation attack.
+  // On add-stake, maturity percentage is preserved (depends only on start time).
+  // exp_start_factor doesn't change, claimed_rewards_wad doesn't change.
+  // reward_debt gets a fresh snapshot added for new tokens only.
+  // Pending rewards stay exactly the same — user can claim separately.
 
-  console.log('\n--- Add-Stake Reward Reset Tests ---\n');
+  console.log('\n--- Add-Stake Tests ---\n');
 
-  // Test: Adding stake resets snapshot — no immediate claimable rewards
-  await test('AddStake: no immediate claimable rewards after add-stake', async () => {
+  // Test: exp_start_factor and pending rewards unchanged after add-stake
+  await test('AddStake: maturity preserved — exp_start_factor unchanged', async () => {
     const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
     await ctx.setup();
     await ctx.createMint(9);
@@ -4083,49 +4082,47 @@ async function runTests() {
     await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
 
     // Wait for partial maturity
-    console.log('    Waiting 10s for partial weight...');
-    await new Promise(r => setTimeout(r, 10000));
+    console.log('    Waiting 15s for partial weight...');
+    await new Promise(r => setTimeout(r, 15000));
 
     // Deposit 2 SOL of rewards
     await ctx.depositRewards(BigInt(2 * LAMPORTS_PER_SOL));
 
-    // Stake 1B more — auto-claims mature rewards, resets snapshot
-    const balBefore = BigInt(await ctx.getBalance(staker.publicKey));
-    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
-    const balAfterStake = BigInt(await ctx.getBalance(staker.publicKey));
-    const autoClaimed = balAfterStake - balBefore;
-    console.log(`    Auto-claimed on add-stake: ${autoClaimed} lamports`);
+    // Read state before add-stake
+    const stateBefore = await ctx.readUserStakeState(staker.publicKey);
+    const expBefore = stateBefore.expStartFactor;
+    const claimedBefore = stateBefore.claimedRewardsWad;
 
-    // Verify reward_debt equals the full snapshot (no immature credit)
-    const poolAfter = await ctx.readPoolState();
-    const stakeAfter = await ctx.readUserStakeState(staker.publicKey);
-    const WAD = 1_000_000_000_000_000_000n;
-    const expectedDebt = (stakeAfter.amount * WAD * poolAfter.accRewardPerWeightedShare + WAD / 2n) / WAD;
-    // Allow ±1 for rounding
-    const diff = stakeAfter.rewardDebt > expectedDebt
-      ? stakeAfter.rewardDebt - expectedDebt
-      : expectedDebt - stakeAfter.rewardDebt;
-    if (diff > 1n) {
-      throw new Error(`reward_debt should equal full snapshot. diff=${diff}`);
-    }
-
-    // Immediately claim — should get 0 (or near-zero from rounding)
-    const balBeforeClaim = BigInt(await ctx.getBalance(staker.publicKey));
+    // Measure claimable before add-stake
+    let bal = BigInt(await ctx.getBalance(staker.publicKey));
     await ctx.claimRewards(staker);
-    const balAfterClaim = BigInt(await ctx.getBalance(staker.publicKey));
-    const immediateClaim = balAfterClaim - balBeforeClaim;
-    console.log(`    Immediate claim after add-stake: ${immediateClaim} lamports`);
+    let balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const claimBefore = balAfter - bal;
+    console.log(`    Claim before add-stake: ${claimBefore} lamports`);
 
-    // Should be near-zero (negative from tx fee)
-    if (immediateClaim > BigInt(100_000)) {
-      throw new Error(`Should not be able to claim immediately after add-stake, got ${immediateClaim}`);
+    // Add 1B more tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Read state after add-stake
+    const stateAfter = await ctx.readUserStakeState(staker.publicKey);
+    console.log(`    exp_start_factor: before=${expBefore}, after=${stateAfter.expStartFactor}`);
+    console.log(`    amount: ${stateBefore.amount} → ${stateAfter.amount}`);
+
+    // exp_start_factor MUST be unchanged
+    if (stateAfter.expStartFactor !== expBefore) {
+      throw new Error(`exp_start_factor changed! ${expBefore} → ${stateAfter.expStartFactor}`);
     }
 
-    console.log('    No immediate claimable after add-stake: OK');
+    // Amount must have increased
+    if (stateAfter.amount !== BigInt(2_000_000_000)) {
+      throw new Error(`Expected 2B, got ${stateAfter.amount}`);
+    }
+
+    console.log('    Maturity preserved: OK');
   });
 
-  // Test: Dust-stake exploit is blocked
-  await test('AddStake: dust-stake exploit is blocked', async () => {
+  // Test: Pending rewards unchanged by add-stake (claim before == claim after)
+  await test('AddStake: pending rewards unchanged by add-stake', async () => {
     const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
     await ctx.setup();
     await ctx.createMint(9);
@@ -4139,41 +4136,75 @@ async function runTests() {
     // Stake 1B tokens
     await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
 
-    // Wait for significant maturity
-    console.log('    Waiting 30s for maturity...');
-    await new Promise(r => setTimeout(r, 30000));
+    // Wait for partial maturity
+    console.log('    Waiting 15s for partial weight...');
+    await new Promise(r => setTimeout(r, 15000));
 
-    // Deposit 2 SOL
-    const deposit = BigInt(2 * LAMPORTS_PER_SOL);
-    await ctx.depositRewards(deposit);
+    // Deposit 2 SOL of rewards
+    await ctx.depositRewards(BigInt(2 * LAMPORTS_PER_SOL));
 
-    // Claim all mature rewards
+    // Add 1B more tokens (pending should stay the same)
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Claim — should get the same vested rewards as before the add-stake
     let bal = BigInt(await ctx.getBalance(staker.publicKey));
     await ctx.claimRewards(staker);
     let balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-    const firstClaim = balAfter - bal;
-    console.log(`    First claim: ${firstClaim} lamports`);
+    const claimAfterAdd = balAfter - bal;
+    console.log(`    Claim after add-stake: ${claimAfterAdd} lamports`);
 
-    // Now try the exploit: stake dust, then claim again
-    bal = BigInt(await ctx.getBalance(staker.publicKey));
-    await ctx.stake(staker, stakerToken, BigInt(1)); // dust amount
-    balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-    const dustAutoClaim = balAfter - bal;
-    console.log(`    Dust stake auto-claim: ${dustAutoClaim} lamports`);
-
-    // Try to claim again — should get nothing
-    bal = BigInt(await ctx.getBalance(staker.publicKey));
-    await ctx.claimRewards(staker);
-    balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-    const exploitClaim = balAfter - bal;
-    console.log(`    Claim after dust stake: ${exploitClaim} lamports`);
-
-    // The exploit claim should be near-zero (negative from fees)
-    if (exploitClaim > BigInt(100_000)) {
-      throw new Error(`Dust-stake exploit not blocked! Got ${exploitClaim} lamports after dust stake`);
+    // Should be positive (rewards vested during the 15s maturity period)
+    if (claimAfterAdd < BigInt(10_000)) {
+      throw new Error(`Pending rewards lost on add-stake! Got ${claimAfterAdd}`);
     }
 
-    console.log('    Dust-stake exploit blocked: OK');
+    console.log('    Pending rewards preserved: OK');
+  });
+
+  // Test: SOL continues to mature after add-stake
+  await test('AddStake: SOL continues to mature after add-stake', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60)); // 60s tau
+
+    const staker = Keypair.generate();
+    await airdropAndConfirm(connection, staker.publicKey, 5 * LAMPORTS_PER_SOL);
+    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
+    await ctx.mintTokens(stakerToken, BigInt(2_000_000_000));
+
+    // Stake 1B tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Wait for partial maturity
+    console.log('    Waiting 15s for partial maturity...');
+    await new Promise(r => setTimeout(r, 15000));
+
+    // Deposit 2 SOL
+    await ctx.depositRewards(BigInt(2 * LAMPORTS_PER_SOL));
+
+    // Claim vested rewards
+    await ctx.claimRewards(staker);
+
+    // Add 1B more tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Wait 30s for more maturity
+    console.log('    Waiting 30s for maturation...');
+    await new Promise(r => setTimeout(r, 30000));
+
+    // Claim — should get newly matured rewards
+    let bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.claimRewards(staker);
+    let balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const matureClaim = balAfter - bal;
+    console.log(`    Claim after 30s maturation: ${matureClaim} lamports`);
+
+    if (matureClaim < BigInt(100_000)) {
+      throw new Error(`SOL not maturing after add-stake! Got ${matureClaim}`);
+    }
+
+    console.log('    SOL continues to mature: OK');
   });
 
   // Test: Conservation — add-stake doesn't create or destroy rewards
@@ -4205,21 +4236,18 @@ async function runTests() {
     const depositAmount = BigInt(2 * LAMPORTS_PER_SOL);
     await ctx.depositRewards(depositAmount);
 
-    // Alice stakes 1B more (triggers auto-claim, resets snapshot)
-    let aliceTotal = BigInt(0);
-    let bal = BigInt(await ctx.getBalance(alice.publicKey));
+    // Alice stakes 1B more (no auto-claim — pending stays the same)
     await ctx.stake(alice, aliceToken, BigInt(1_000_000_000));
-    let balAfter = BigInt(await ctx.getBalance(alice.publicKey));
-    aliceTotal += (balAfter - bal);
 
     // Wait for more maturity
     console.log('    Waiting 30s for maturity...');
     await new Promise(r => setTimeout(r, 30000));
 
     // Both claim
-    bal = BigInt(await ctx.getBalance(alice.publicKey));
+    let aliceTotal = BigInt(0);
+    let bal = BigInt(await ctx.getBalance(alice.publicKey));
     await ctx.claimRewards(alice);
-    balAfter = BigInt(await ctx.getBalance(alice.publicKey));
+    let balAfter = BigInt(await ctx.getBalance(alice.publicKey));
     aliceTotal += (balAfter - bal);
 
     bal = BigInt(await ctx.getBalance(bob.publicKey));
@@ -4253,110 +4281,8 @@ async function runTests() {
     console.log('    Conservation maintained: OK');
   });
 
-  // Test: Weight continuity — absolute weighted stake is preserved across add-stake
-  await test('AddStake: weight continuity (1M@50% + 1M = 2M@25%)', async () => {
-    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
-    await ctx.setup();
-    await ctx.createMint(9);
-    const tau = BigInt(60); // 60s tau (minimum allowed)
-    await ctx.initializePool(tau);
-
-    const staker = Keypair.generate();
-    await airdropAndConfirm(connection, staker.publicKey, 3 * LAMPORTS_PER_SOL);
-    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
-    await ctx.mintTokens(stakerToken, BigInt(2_000_000_000));
-
-    // Stake 1B tokens
-    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
-
-    // Wait ~42s for ~50% maturity (1 - e^(-42/60) ≈ 0.503)
-    console.log('    Waiting 42s for ~50% maturity...');
-    await new Promise(r => setTimeout(r, 42000));
-
-    // Read state before add-stake
-    const stateBefore = await ctx.readUserStakeState(staker.publicKey);
-    const expBefore = stateBefore.expStartFactor;
-    const amountBefore = stateBefore.amount;
-    console.log(`    Before: amount=${amountBefore}, exp_start_factor=${expBefore}`);
-
-    // Add 1B more tokens
-    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
-
-    // Read state after add-stake
-    const stateAfter = await ctx.readUserStakeState(staker.publicKey);
-    const expAfter = stateAfter.expStartFactor;
-    const amountAfter = stateAfter.amount;
-    console.log(`    After:  amount=${amountAfter}, exp_start_factor=${expAfter}`);
-
-    // Verify amount doubled
-    if (amountAfter !== BigInt(2_000_000_000)) {
-      throw new Error(`Expected 2B, got ${amountAfter}`);
-    }
-
-    // Verify exp_start_factor is the weighted average:
-    // new_exp = (old_amount * old_exp + new_amount * new_exp_fresh) / total_amount
-    // For a fresh stake, exp_start_factor ≈ exp(t/tau) which is > old_exp.
-    // The blended factor should be between old_exp and new_exp.
-    if (expAfter <= expBefore) {
-      throw new Error(`Blended exp_factor ${expAfter} should be > old ${expBefore}`);
-    }
-
-    // Verify weight continuity property:
-    // The blended factor satisfies: weight = amount * (1 - exp_neg_t * exp_factor / WAD)
-    // With the correct blend, the absolute weight should be approximately unchanged.
-    // old_weight ≈ 1B * (1 - old_exp * exp_neg_t) where exp_neg_t = exp(-t/tau)
-    // new_weight ≈ 2B * (1 - blended_exp * exp_neg_t)
-    // These should be approximately equal.
-    //
-    // We can verify this indirectly: the new exp_factor should satisfy
-    // amount_after * (WAD - decay_after) ≈ amount_before * (WAD - decay_before)
-    // where decay = exp_neg_t * exp_factor
-    //
-    // Since both use the same exp_neg_t at the same time, this simplifies to:
-    // 2B * (WAD - blended_exp * exp_neg_t) ≈ 1B * (WAD - old_exp * exp_neg_t)
-    // => 2B * blended_exp ≈ 2B * WAD - 1B * WAD + 1B * old_exp
-    //    (dividing out exp_neg_t from both decay terms)
-    // => blended_exp ≈ WAD + (old_exp - WAD) / 2
-    //    = (WAD + old_exp) / 2
-    //
-    // So verify the blend is approximately the midpoint of WAD and old_exp.
-    const WAD = 1_000_000_000_000_000_000n;
-    // The old exp_start_factor for a stake at t=0 (base_time) is WAD (exp(0)=1).
-    // The new exp_start_factor for a stake at t=42 is exp(42/60) ≈ 2.01 * WAD.
-    // Blend = (1B * WAD + 1B * ~2.01*WAD) / 2B ≈ 1.505 * WAD
-    // This means weight = 2B * (1 - 1.505 * exp(-42/60))
-    //                    ≈ 2B * (1 - 1.505 * 0.497) ≈ 2B * 0.252 ≈ 504M
-    // vs old weight     = 1B * (1 - 1.0 * 0.497) ≈ 1B * 0.503 ≈ 503M
-    // So weight is approximately preserved (within rounding).
-
-    // Verify blended exp is between WAD and 3*WAD (reasonable range)
-    if (expAfter < WAD) {
-      throw new Error(`Blended exp_factor ${expAfter} should be >= WAD`);
-    }
-    if (expAfter > 3n * WAD) {
-      throw new Error(`Blended exp_factor ${expAfter} unreasonably large`);
-    }
-
-    // Verify reward_debt is set to full snapshot (no immature credit)
-    const pool = await ctx.readPoolState();
-    const expectedDebt = (amountAfter * WAD * pool.accRewardPerWeightedShare + WAD / 2n) / WAD;
-    const debtDiff = stateAfter.rewardDebt > expectedDebt
-      ? stateAfter.rewardDebt - expectedDebt
-      : expectedDebt - stateAfter.rewardDebt;
-    if (debtDiff > 1n) {
-      throw new Error(`reward_debt not set to full snapshot: diff=${debtDiff}`);
-    }
-
-    // Verify claimed_rewards_wad is 0
-    if (stateAfter.claimedRewardsWad !== 0n) {
-      throw new Error(`claimed_rewards_wad should be 0, got ${stateAfter.claimedRewardsWad}`);
-    }
-
-    console.log('    Weight continuity verified: OK');
-  });
-
-  // Test: Multiple add-stakes — repeated dust doesn't accumulate rewards
-  await test('AddStake: repeated dust-stakes yield no extra rewards', async () => {
+  // Test: Dust-stake doesn't extract extra rewards
+  await test('AddStake: dust-stake yields no extra rewards', async () => {
     const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
     await ctx.setup();
     await ctx.createMint(9);
@@ -4384,33 +4310,166 @@ async function runTests() {
     const initialClaim = balAfter - bal;
     console.log(`    Initial claim: ${initialClaim} lamports`);
 
-    // Now attempt the exploit: dust-stake → claim, repeated 3 times
+    // Dust-stake → claim, repeated 3 times
     let totalExploitGain = 0n;
     for (let i = 0; i < 3; i++) {
-      bal = BigInt(await ctx.getBalance(staker.publicKey));
       await ctx.stake(staker, stakerToken, BigInt(1)); // dust
-      balAfter = BigInt(await ctx.getBalance(staker.publicKey));
-      const dustAutoClaim = balAfter - bal;
 
       bal = BigInt(await ctx.getBalance(staker.publicKey));
       await ctx.claimRewards(staker);
       balAfter = BigInt(await ctx.getBalance(staker.publicKey));
       const postDustClaim = balAfter - bal;
-
-      const roundGain = dustAutoClaim + postDustClaim;
-      totalExploitGain += roundGain;
-      console.log(`    Round ${i + 1}: dust auto-claim=${dustAutoClaim}, post-claim=${postDustClaim}`);
+      totalExploitGain += postDustClaim;
+      console.log(`    Round ${i + 1}: claim after dust=${postDustClaim}`);
     }
 
     console.log(`    Total exploit attempt gain: ${totalExploitGain} lamports`);
 
-    // The total gain from 3 rounds of dust-staking should be negligible
-    // (just rounding/new-reward accumulation, not a percentage of the deposit)
     if (totalExploitGain > BigInt(100_000)) {
-      throw new Error(`Repeated dust-stake yielded ${totalExploitGain} — exploit not blocked!`);
+      throw new Error(`Dust-stake yielded ${totalExploitGain} — exploit not blocked!`);
     }
 
-    console.log('    Repeated dust-stake exploit blocked: OK');
+    console.log('    Dust-stake exploit blocked: OK');
+  });
+    console.log(`    Auto-claim on add-stake: ${autoClaimOnAdd} lamports`);
+
+    // After add-stake, verify immature credit is encoded in reward_debt
+    const WAD = 1_000_000_000_000_000_000n;
+    const poolAfter = await ctx.readPoolState();
+    const stakeAfter = await ctx.readUserStakeState(staker.publicKey);
+    const totalAmountWad = stakeAfter.amount * WAD;
+    // Full snapshot = total_amount_wad * acc_rps / WAD
+    const fullDebt = (totalAmountWad * poolAfter.accRewardPerWeightedShare + WAD / 2n) / WAD;
+    // credit_in_debt = fullDebt - actual_reward_debt (immature credit lowers reward_debt)
+    const creditInDebt = fullDebt - stakeAfter.rewardDebt;
+
+    console.log(`    reward_debt=${stakeAfter.rewardDebt}, full_snapshot=${fullDebt}`);
+    console.log(`    credit_in_debt (immature preserved): ${creditInDebt}`);
+    console.log(`    claimed_rewards_wad (pending=0 offset): ${stakeAfter.claimedRewardsWad}`);
+
+    // Immature credit must be > 0 (there were unvested rewards before add-stake)
+    if (creditInDebt <= 0n) {
+      throw new Error('Immature credit NOT preserved: credit_in_debt is 0');
+    }
+    // claimed_rewards_wad must be > 0 (offsets credit so pending=0 at current weight)
+    if (stakeAfter.claimedRewardsWad <= 0n) {
+      throw new Error('claimed_rewards_wad should be > 0 to offset credit at current weight');
+    }
+
+    console.log('    Immature SOL preserved after add-stake: OK');
+  });
+
+  // Test: No SOL become mature suddenly on add-stake (pending=0 at current weight)
+  await test('AddStake: no SOL become mature suddenly on add-stake', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60)); // 60s tau
+
+    const staker = Keypair.generate();
+    await airdropAndConfirm(connection, staker.publicKey, 5 * LAMPORTS_PER_SOL);
+    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
+    await ctx.mintTokens(stakerToken, BigInt(2_000_000_000));
+
+    // Stake 1B tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Wait for partial maturity
+    console.log('    Waiting 15s for partial maturity...');
+    await new Promise(r => setTimeout(r, 15000));
+
+    // Deposit 2 SOL
+    await ctx.depositRewards(BigInt(2 * LAMPORTS_PER_SOL));
+
+    // Claim all vested rewards first
+    let bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.claimRewards(staker);
+    let balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const vestedBefore = balAfter - bal;
+    console.log(`    Vested claim: ${vestedBefore} lamports`);
+
+    // Now add-stake — should auto-claim ~0 (we just claimed)
+    bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+    balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const addStakeAutoClaim = balAfter - bal;
+    console.log(`    Auto-claim on add-stake: ${addStakeAutoClaim} lamports`);
+
+    // Immediately claim — should get 0 (no SOL became mature suddenly)
+    bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.claimRewards(staker);
+    balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const immediateClaim = balAfter - bal;
+    console.log(`    Immediate claim after add-stake: ${immediateClaim} lamports`);
+
+    // Should be near-zero (negative from tx fee is expected)
+    if (immediateClaim > BigInt(100_000)) {
+      throw new Error(`SOL became mature suddenly on add-stake! Got ${immediateClaim} lamports`);
+    }
+
+    console.log('    No sudden maturity on add-stake: OK');
+  });
+
+  // Test: After add-stake, SOL continues to mature and is redeemable
+  await test('AddStake: SOL continues to mature after add-stake', async () => {
+    const ctx = new TestContext(connection, Keypair.generate(), programAuthority);
+    await ctx.setup();
+    await ctx.createMint(9);
+    await ctx.initializePool(BigInt(60)); // 60s tau
+
+    const staker = Keypair.generate();
+    await airdropAndConfirm(connection, staker.publicKey, 5 * LAMPORTS_PER_SOL);
+    const stakerToken = await ctx.createUserTokenAccount(staker.publicKey);
+    await ctx.mintTokens(stakerToken, BigInt(2_000_000_000));
+
+    // Stake 1B tokens
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+
+    // Wait for partial maturity
+    console.log('    Waiting 15s for partial maturity...');
+    await new Promise(r => setTimeout(r, 15000));
+
+    // Deposit 2 SOL
+    await ctx.depositRewards(BigInt(2 * LAMPORTS_PER_SOL));
+
+    // Add 1B more (auto-claims vested, preserves immature)
+    let bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.stake(staker, stakerToken, BigInt(1_000_000_000));
+    let balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const autoClaimOnAdd = balAfter - bal;
+    console.log(`    Auto-claim on add-stake: ${autoClaimOnAdd} lamports`);
+
+    // Wait 30s for more weight to grow (immature credit should partially vest)
+    console.log('    Waiting 30s for partial maturation...');
+    await new Promise(r => setTimeout(r, 30000));
+
+    // Claim — should get some newly matured rewards
+    bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.claimRewards(staker);
+    balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const claim1 = balAfter - bal;
+    console.log(`    Claim after 30s: ${claim1} lamports`);
+
+    if (claim1 < BigInt(100_000)) {
+      throw new Error(`SOL not maturing after add-stake! Claim after 30s = ${claim1}`);
+    }
+
+    // Wait another 30s and claim again — should get more
+    console.log('    Waiting 30s more...');
+    await new Promise(r => setTimeout(r, 30000));
+
+    bal = BigInt(await ctx.getBalance(staker.publicKey));
+    await ctx.claimRewards(staker);
+    balAfter = BigInt(await ctx.getBalance(staker.publicKey));
+    const claim2 = balAfter - bal;
+    console.log(`    Claim after 60s more: ${claim2} lamports`);
+
+    if (claim2 < BigInt(100_000)) {
+      throw new Error(`SOL stopped maturing! Claim after 60s more = ${claim2}`);
+    }
+
+    console.log(`    Total matured after add-stake: ${claim1 + claim2} lamports`);
+    console.log('    SOL continues to mature after add-stake: OK');
   });
 
   // ========== StakeOnBehalf Tests ==========
